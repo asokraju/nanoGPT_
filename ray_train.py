@@ -5,7 +5,7 @@ import glob
 import logging
 from ray.train.torch import TorchTrainer
 from ray.train import CheckpointConfig, RunConfig, ScalingConfig
-# Assuming train_func is defined in the same script or imported from another module
+
 
 def find_highest_checkpoint_folder(base_path):
     """
