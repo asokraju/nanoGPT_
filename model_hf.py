@@ -21,6 +21,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions
 )
 
+
 class GPTConfig(PretrainedConfig):
     """
     GPTConfig is a configuration class to store out configuration for our GPT model.
@@ -137,6 +138,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))  # (B, T, C)
         return y
 
+
 class MLP(nn.Module):
     """
     Implements the Feed-Forward Network (MLP) component of a Transformer block.
@@ -168,7 +170,7 @@ class MoE(nn.Module):
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
-        self.gate = nn.Linear(config.n_embd, self.num_experts)
+        self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -205,7 +207,7 @@ class MoE(nn.Module):
             if mask.any():
                 y[mask] = expert(x_repeated[mask])
 
-        # Reshape y to (B*T, num_experts_per_tok, C)
+        # Reshape y to (B, T, num_experts_per_tok, C)
         y = y.view(B, T, self.num_experts_per_tok, C)
 
         # Apply the weights
@@ -218,16 +220,17 @@ class MoE(nn.Module):
         return y
 
 
-
-class Block(nn.Module): 
-    """ 
-    Represents a single Transformer block, consisting of a LayerNorm, Causal Self-Attention, and a Feed-Forward Network (MLP or MoE). 
-    """ 
-    def init(self, config: GPTConfig): 
-        super().init() 
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias) 
-        self.attn = CausalSelfAttention(config) 
+class Block(nn.Module):
+    """
+    Represents a single Transformer block, consisting of a LayerNorm, 
+    Causal Self-Attention, and a Feed-Forward Network (MLP or MoE).
+    """
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        
         if config.use_moe:
             print("Using Mixture of Experts (MoE) in MLP")
             self.mlp = MoE(config)
@@ -252,6 +255,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         
         return x
+
 
 class GPT(PreTrainedModel):
     """
@@ -337,7 +341,7 @@ class GPT(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        ) -> BaseModelOutputWithPastAndCrossAttentions:
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
         """
         Forward pass for the GPT model.
         
@@ -433,10 +437,7 @@ class GPT(PreTrainedModel):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ]
+        optim_groups = [            {"params": decay_params, "weight_decay": weight_decay},            {"params": nodecay_params, "weight_decay": 0.0},        ]
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -488,7 +489,7 @@ class GPT(PreTrainedModel):
         **kwargs
     ) -> dict:
         """
-        Prepares inputs for the generation method, handling past key values and position IDs.
+        Prepares inputs specifically for generation tasks.
         
         Args:
             input_ids (torch.Tensor): Input token IDs.
@@ -497,7 +498,7 @@ class GPT(PreTrainedModel):
             **kwargs: Additional arguments.
         
         Returns:
-            dict: Model inputs.
+            dict: Model inputs for generation.
         """
         attention_mask = kwargs.get("attention_mask", None)
         position_ids = kwargs.get("position_ids", None)
@@ -507,7 +508,7 @@ class GPT(PreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+                position_ids = position_ids[:, -input_ids.shape[1]:]
         else:
             position_ids = None
 
@@ -518,13 +519,16 @@ class GPT(PreTrainedModel):
 
         return model_inputs
 
-class GPTLMHeadModel(GPT): 
-    """ 
-    GPT Language Model Head Model extending the base GPT class. 
-    It includes the transformer model with embedding layers, multiple transformer blocks, and an output layer for language modeling. 
-    """ 
-    config_class = GPTConfig 
+
+class GPTLMHeadModel(GPT):
+    """
+    GPT Language Model Head Model extending the base GPT class.
+    It includes the transformer model with embedding layers, multiple transformer blocks,
+    and an output layer for language modeling.
+    """
+    config_class = GPTConfig
     _tied_weights_keys = ["lm_head.weight"]
+
     def __init__(self, config: GPTConfig):
         super().__init__(config)
         # The base GPT class already initializes the transformer and lm_head with tied weights
@@ -663,5 +667,3 @@ class GPTLMHeadModel(GPT):
                 attentions=outputs.attentions,
                 cross_attentions=outputs.cross_attentions,
             )
-
-
