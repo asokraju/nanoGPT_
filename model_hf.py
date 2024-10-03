@@ -1,11 +1,12 @@
 """
 GPT Language Model Implementation
-=================================
+================================
 
 This module provides a complete implementation of a GPT (Generative Pre-trained Transformer)
 language model, including optional Mixture of Experts (MoE) layers for enhanced capacity.
 The model is built using PyTorch and integrates with Hugging Face's Transformers library for
-configuration and output handling.
+configuration and output handling. Additionally, it includes mechanisms to log and monitor
+the usage of experts within MoE layers, facilitating balanced utilization and model diagnostics.
 
 Classes
 -------
@@ -23,6 +24,9 @@ Classes
      - `use_moe` (bool): Whether to use Mixture of Experts.
      - `num_experts` (int): Number of experts in MoE.
      - `num_experts_per_tok` (int): Number of experts to route per token.
+     - `moe_loss` (bool): Whether to include MoE auxiliary loss for load balancing.
+     - `moe_loss_type` (str): Type of load balancing loss (`'variance_penalty'`, `'entropy_regularization'`, `'diversity_regularization'`).
+     - `moe_loss_coef` (float): Coefficient for the auxiliary loss.
 
 2. **LayerNorm**
    - **Purpose:** Custom Layer Normalization with an optional bias.
@@ -44,9 +48,13 @@ Classes
 
 5. **MoE**
    - **Purpose:** Implements a Mixture of Experts (MoE) layer to dynamically route inputs to a subset of expert networks.
+     - **Additional Features:** Tracks and logs expert usage statistics to ensure balanced utilization.
    - **Methods:**
      - `__init__(self, config: GPTConfig)`: Initializes the MoE layer with multiple experts and a gating mechanism.
-     - `forward(self, x: torch.Tensor) -> torch.Tensor`: Routes inputs to experts based on gating scores and aggregates their outputs.
+     - `forward(self, x: torch.Tensor) -> torch.Tensor`: Routes inputs to experts based on gating scores, aggregates their outputs, and computes auxiliary loss if enabled.
+     - `get_auxiliary_loss(self) -> torch.Tensor`: Retrieves the computed auxiliary loss.
+     - `get_usage_counts(self) -> torch.Tensor`: Retrieves the current usage counts for each expert.
+     - `reset_usage_counts(self)`: Resets the expert usage counts and total assignments, typically called after logging.
 
 6. **Block**
    - **Purpose:** Represents a single Transformer block, comprising LayerNorm, Causal Self-Attention, and an MLP or MoE.
@@ -81,58 +89,6 @@ Classes
      - `set_output_embeddings(self, new_embeddings: nn.Linear)`: Sets new output embeddings and ties weights.
      - `prepare_inputs_for_generation(...) -> dict`: Prepares inputs specifically for generation tasks.
      - `forward(...) -> CausalLMOutputWithCrossAttentions`: Defines the forward pass, computing logits and optionally loss if labels are provided.
-
-Usage
------
-
-To utilize the GPT language model, follow these steps:
-
-1. **Configuration:**
-   - Instantiate a `GPTConfig` object with desired parameters.
-   ```python
-   config = GPTConfig(
-       block_size=1024,
-       vocab_size=50304,
-       n_layer=12,
-       n_head=12,
-       n_embd=768,
-       dropout=0.1,
-       use_moe=True,
-       num_experts=8,
-       num_experts_per_tok=2
-   )
-   ```
-
-2. **Model Initialization:**
-   - Create an instance of `GPTLMHeadModel` using the configuration.
-   ```python
-   model = GPTLMHeadModel(config)
-   ```
-
-3. **Forward Pass:**
-   - Pass input tensors through the model to obtain outputs.
-   ```python
-   outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-   ```
-
-4. **Optimization:**
-   - Configure the optimizer as needed.
-   ```python
-   optimizer = model.configure_optimizers(
-       weight_decay=0.01,
-       learning_rate=5e-5,
-       betas=(0.9, 0.999),
-       device_type='cuda'
-   )
-   ```
-
-5. **Generation:**
-   - Prepare inputs for text generation tasks.
-   ```python
-   generation_inputs = model.prepare_inputs_for_generation(input_ids)
-   generated_outputs = model.generate(**generation_inputs)
-   ```
-
 Notes
 -----
 

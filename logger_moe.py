@@ -1,3 +1,25 @@
+
+'''
+Call Backs for MoE Utilization
+================================
+
+1. **MoEUsageLoggingCallback**
+   - **Purpose:** A custom callback for Hugging Face's `Trainer` to log Mixture of Experts (MoE) usage statistics to the console.
+   - **Methods:**
+     - `__init__(self, logger=None, log_interval=100)`: Initializes the callback with an optional logger and logging interval.
+     - `on_step_end(...)`: Called at the end of each training step to log expert usage if the interval is met.
+     - `on_epoch_end(...)`: Optionally logs expert usage at the end of each epoch.
+     - `_get_moe_layers(self, model) -> list`: Retrieves all MoE layers from the model.
+
+2. **MoEUsageTensorBoardCallback**
+    - **Purpose:** A custom callback for Hugging Face's `Trainer` to log Mixture of Experts (MoE) usage statistics to TensorBoard for advanced visualization.
+    - **Methods:**
+      - `__init__(self, log_interval=100, tb_writer=None)`: Initializes the callback with an optional TensorBoard `SummaryWriter` and logging interval.
+      - `on_step_end(...)`: Called at the end of each training step to log expert usage to TensorBoard if the interval is met.
+      - `on_train_end(...)`: Closes the TensorBoard writer at the end of training.
+      - `_get_moe_layers(self, model) -> list`: Retrieves all MoE layers from the model.
+'''
+
 from transformers import TrainerCallback, TrainerState, TrainerControl
 import logging
 import torch
