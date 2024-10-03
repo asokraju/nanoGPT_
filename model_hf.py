@@ -185,6 +185,9 @@ class GPTConfig(PretrainedConfig):
         use_moe: bool = False,
         num_experts: int = 8,
         num_experts_per_tok: int = 2,
+        moe_loss: bool = True,  # Option to enable/disable MoE loss
+        moe_loss_type: str = "variance_penalty",  # Type of load balancing loss
+        moe_loss_coef: float = 1e-3,  # Coefficient for the auxiliary loss
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -198,6 +201,10 @@ class GPTConfig(PretrainedConfig):
         self.use_moe = use_moe
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.moe_loss = moe_loss
+        self.moe_loss_type = moe_loss_type  # Options: 'variance_penalty', 'entropy_regularization', 'diversity_regularization'
+        self.moe_loss_coef = moe_loss_coef
+
 
 
 class LayerNorm(nn.Module):
@@ -308,6 +315,8 @@ class MoE(nn.Module):
     """
     Implements a Mixture of Experts (MoE) layer.
     Dynamically routes inputs to a subset of expert networks based on gating scores.
+    Includes optional load balancing auxiliary losses to ensure balanced expert utilization.
+    Also tracks and logs expert usage statistics.
     """
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -315,6 +324,17 @@ class MoE(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.moe_loss = config.moe_loss
+        self.moe_loss_type = config.moe_loss_type
+        self.moe_loss_coef = config.moe_loss_coef
+
+        # Validate loss type
+        valid_loss_types = ["variance_penalty", "entropy_regularization", "diversity_regularization"]
+        assert self.moe_loss_type in valid_loss_types, f"Invalid moe_loss_type. Choose from {valid_loss_types}"
+
+        # Initialize expert usage counters
+        self.register_buffer("expert_usage_counts", torch.zeros(self.num_experts, dtype=torch.long))
+        self.total_assignments = 0  # Total number of expert assignments
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -331,13 +351,22 @@ class MoE(nn.Module):
 
         # Compute gating scores
         scores = self.gate(x_flat)  # (B*T, num_experts)
+
+        # Select top-k experts
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, num_experts_per_tok)
 
-        # Softmax the top-k scores
+        # Softmax the top-k scores to get weights
         topk_weights = F.softmax(topk_scores, dim=-1)  # (B*T, num_experts_per_tok)
 
         # Flatten the expert indices
         flat_expert_indices = topk_indices.view(-1)  # (B*T*num_experts_per_tok,)
+
+        # Update expert usage counts
+        with torch.no_grad():
+            # Count occurrences of each expert in the current batch
+            counts = flat_expert_indices.bincount(minlength=self.num_experts)
+            self.expert_usage_counts += counts
+            self.total_assignments += flat_expert_indices.size(0)
 
         # Repeat inputs for each expert assignment
         x_repeated = x_flat.unsqueeze(1).repeat(1, self.num_experts_per_tok, 1).view(-1, C)  # (B*T*num_experts_per_tok, C)
@@ -361,8 +390,61 @@ class MoE(nn.Module):
         # Sum the experts' outputs
         y = y.sum(dim=2)  # (B, T, C)
 
+        # Initialize auxiliary loss
+        self.auxiliary_loss = 0.0
+
+        if self.moe_loss:
+            with torch.no_grad():
+                # One-hot encoding of expert assignments
+                one_hot = F.one_hot(flat_expert_indices, num_classes=self.num_experts).type_as(scores)
+                # Compute the average usage of each expert
+                expert_usage = one_hot.sum(dim=0) / x_flat.size(0)  # (num_experts,)
+
+                if self.moe_loss_type == "variance_penalty":
+                    # Load Balancing Loss: Variance of expert usage
+                    mean_usage = expert_usage.mean()
+                    variance = torch.mean((expert_usage - mean_usage) ** 2)
+                    self.auxiliary_loss = self.moe_loss_coef * variance
+
+                elif self.moe_loss_type == "entropy_regularization":
+                    # Entropy Regularization: Maximize entropy of expert usage
+                    entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
+                    # We want to maximize entropy, so minimize negative entropy
+                    self.auxiliary_loss = self.moe_loss_coef * (-entropy)
+
+                elif self.moe_loss_type == "diversity_regularization":
+                    # Diversity Regularization: Encourage uniform distribution of expert assignments
+                    uniform = torch.ones_like(expert_usage) / self.num_experts
+                    divergence = F.kl_div(expert_usage.log(), uniform, reduction='sum')
+                    self.auxiliary_loss = self.moe_loss_coef * divergence
+
         return y
 
+    def get_auxiliary_loss(self) -> torch.Tensor:
+        """
+        Retrieves the computed auxiliary loss.
+        
+        Returns:
+            torch.Tensor: Auxiliary loss tensor.
+        """
+        return self.auxiliary_loss
+
+    def get_usage_counts(self) -> torch.Tensor:
+        """
+        Retrieves the expert usage counts.
+        
+        Returns:
+            torch.Tensor: Tensor containing usage counts for each expert.
+        """
+        return self.expert_usage_counts
+
+    def reset_usage_counts(self):
+        """
+        Resets the expert usage counts and total assignments.
+        Call this method after logging to start fresh statistics.
+        """
+        self.expert_usage_counts.zero_()
+        self.total_assignments = 0
 
 class Block(nn.Module):
     """
@@ -668,7 +750,7 @@ class GPTLMHeadModel(GPT):
     """
     GPT Language Model Head Model extending the base GPT class.
     It includes the transformer model with embedding layers, multiple transformer blocks,
-    and an output layer for language modeling.
+    an optional MoE layer, and an output layer for language modeling.
     """
     config_class = GPTConfig
     _tied_weights_keys = ["lm_head.weight"]
@@ -709,7 +791,6 @@ class GPTLMHeadModel(GPT):
         Returns:
             dict: Model inputs for generation.
         """
-        token_type_ids = kwargs.get("token_type_ids", None)
         attention_mask = kwargs.get("attention_mask", None)
         position_ids = kwargs.get("position_ids", None)
 
@@ -788,14 +869,27 @@ class GPTLMHeadModel(GPT):
             # Shift logits and labels for next-token prediction
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            # Compute loss
-            loss = F.cross_entropy(
+            # Compute primary loss
+            primary_loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-1
             )
+
+            # Initialize auxiliary loss
+            aux_loss = 0.0
+
+            if self.config.use_moe:
+                # Aggregate auxiliary losses from all MoE layers
+                for block in self.transformer.h:
+                    if isinstance(block.mlp, MoE):
+                        aux_loss += block.mlp.get_auxiliary_loss()
+
+            # Combine losses
+            total_loss = primary_loss + aux_loss
+
             return CausalLMOutputWithCrossAttentions(
-                loss=loss,
+                loss=total_loss,
                 logits=logits,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
