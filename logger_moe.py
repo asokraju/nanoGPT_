@@ -10,7 +10,64 @@ Call Backs for MoE Utilization
      - `on_step_end(...)`: Called at the end of each training step to log expert usage if the interval is met.
      - `on_epoch_end(...)`: Optionally logs expert usage at the end of each epoch.
      - `_get_moe_layers(self, model) -> list`: Retrieves all MoE layers from the model.
+     - Usage with logging
 
+            Setting Up the Logger
+            ```python
+            import logging
+
+            # Configure the root logger or create a specific logger
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(levelname)s - %(message)s'
+            )
+            logger = logging.getLogger('MoELogger')
+            ```
+
+            Initializing the Callback
+            ```python
+            # Initialize the MoE usage logging callback
+            moe_logging_callback = MoEUsageLoggingCallback(
+                logger=logger,
+                log_interval=100  # Log every 100 training steps
+            )
+
+            ```
+
+            Initializing the Trainer with the Callback
+            ```python
+            from transformers import Trainer, TrainingArguments
+
+            # Define training arguments
+            training_args = TrainingArguments(
+                output_dir="./results",
+                num_train_epochs=3,
+                per_device_train_batch_size=8,
+                per_device_eval_batch_size=8,
+                learning_rate=5e-5,
+                weight_decay=0.01,
+                logging_dir="./logs",
+                logging_steps=10,  # Already handled by the callback
+                # Other arguments as needed
+            )
+
+            # Assume train_dataset and eval_dataset are predefined
+            # train_dataset = ...
+            # eval_dataset = ...
+
+            # Initialize the Trainer with the MoE usage logging callback
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                callbacks=[moe_logging_callback],  # Add the custom callback here
+            )
+
+            # Start training
+            trainer.train()
+
+            ```
 2. **MoEUsageTensorBoardCallback**
     - **Purpose:** A custom callback for Hugging Face's `Trainer` to log Mixture of Experts (MoE) usage statistics to TensorBoard for advanced visualization.
     - **Methods:**
@@ -18,6 +75,33 @@ Call Backs for MoE Utilization
       - `on_step_end(...)`: Called at the end of each training step to log expert usage to TensorBoard if the interval is met.
       - `on_train_end(...)`: Closes the TensorBoard writer at the end of training.
       - `_get_moe_layers(self, model) -> list`: Retrieves all MoE layers from the model.
+      - Usage with tensorboad
+            Intialize
+            ```python
+            from transformers import Trainer, TrainingArguments
+            from torch.utils.tensorboard import SummaryWriter
+
+            # Initialize TensorBoard SummaryWriter
+            tb_writer = SummaryWriter(log_dir="./tensorboard_logs")
+
+            # Initialize the TensorBoard logging callback
+            moe_tb_callback = MoEUsageTensorBoardCallback(
+                log_interval=100,
+                tb_writer=tb_writer
+            )
+
+            # Initialize the Trainer with the TensorBoard callback
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                callbacks=[moe_tb_callback],  # Add the TensorBoard callback here
+            )
+
+            # Start training
+            trainer.train()
+            ```
 '''
 
 from transformers import TrainerCallback, TrainerState, TrainerControl
@@ -223,93 +307,3 @@ class MoEUsageLoggingCallback(TrainerCallback):
         return moe_layers
 
 
-# Usage
-'''
-## Usage with tensorboad
-```python
-from transformers import Trainer, TrainingArguments
-from torch.utils.tensorboard import SummaryWriter
-
-# Initialize TensorBoard SummaryWriter
-tb_writer = SummaryWriter(log_dir="./tensorboard_logs")
-
-# Initialize the TensorBoard logging callback
-moe_tb_callback = MoEUsageTensorBoardCallback(
-    log_interval=100,
-    tb_writer=tb_writer
-)
-
-# Initialize the Trainer with the TensorBoard callback
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    callbacks=[moe_tb_callback],  # Add the TensorBoard callback here
-)
-
-# Start training
-trainer.train()
-```
-
-## Usage with logging
-
-Setting Up the Logger
-```python
-import logging
-
-# Configure the root logger or create a specific logger
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('MoELogger')
-
-```
-
-Initializing the Callback
-```python
-# Initialize the MoE usage logging callback
-moe_logging_callback = MoEUsageLoggingCallback(
-    logger=logger,
-    log_interval=100  # Log every 100 training steps
-)
-
-```
-
-Initializing the Trainer with the Callback
-```python
-from transformers import Trainer, TrainingArguments
-
-# Define training arguments
-training_args = TrainingArguments(
-    output_dir="./results",
-    num_train_epochs=3,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    learning_rate=5e-5,
-    weight_decay=0.01,
-    logging_dir="./logs",
-    logging_steps=10,  # Already handled by the callback
-    # Other arguments as needed
-)
-
-# Assume train_dataset and eval_dataset are predefined
-# train_dataset = ...
-# eval_dataset = ...
-
-# Initialize the Trainer with the MoE usage logging callback
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    callbacks=[moe_logging_callback],  # Add the custom callback here
-)
-
-# Start training
-trainer.train()
-
-```
-
-'''
