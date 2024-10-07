@@ -212,7 +212,8 @@ import inspect
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import (
@@ -220,9 +221,9 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions
 )
 
-from transformers import TrainerCallback, TrainerState, TrainerControl, Trainer
+from transformers import TrainerCallback, TrainerState, TrainerControl, Trainer, TrainingArguments
 import logging
-from torch.utils.tensorboard import SummaryWriter
+
 
 class GPTConfig(PretrainedConfig):
     """
@@ -370,12 +371,6 @@ class MLP(nn.Module):
 
 
 class MoE(nn.Module):
-    """
-    Implements a Mixture of Experts (MoE) layer.
-    Dynamically routes inputs to a subset of expert networks based on gating scores.
-    Includes optional load balancing auxiliary losses to ensure balanced expert utilization.
-    Also tracks and logs expert usage statistics.
-    """
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.num_experts = config.num_experts
@@ -395,15 +390,6 @@ class MoE(nn.Module):
         self.total_assignments = 0  # Total number of expert assignments
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE layer.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, T, C)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (B, T, C)
-        """
         B, T, C = x.size()
         x_flat = x.view(-1, C)  # (B*T, C)
 
@@ -414,14 +400,13 @@ class MoE(nn.Module):
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, num_experts_per_tok)
 
         # Softmax the top-k scores to get weights
-        topk_weights = F.softmax(topk_scores, dim=-1)  # (B*T, num_experts_per_tok)
+        topk_weights = F.softmax(topk_scores, dim=-1).view(B, T, self.num_experts_per_tok, 1)  # (B, T, num_experts_per_tok, 1)
 
         # Flatten the expert indices
         flat_expert_indices = topk_indices.view(-1)  # (B*T*num_experts_per_tok,)
 
         # Update expert usage counts
         with torch.no_grad():
-            # Count occurrences of each expert in the current batch
             counts = flat_expert_indices.bincount(minlength=self.num_experts)
             self.expert_usage_counts += counts
             self.total_assignments += flat_expert_indices.size(0)
@@ -431,7 +416,6 @@ class MoE(nn.Module):
 
         # Initialize output tensor
         y = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
-
 
         # Apply each expert to its assigned inputs
         for i, expert in enumerate(self.experts):
@@ -443,37 +427,26 @@ class MoE(nn.Module):
         y = y.view(B, T, self.num_experts_per_tok, C)
 
         # Apply the weights
-        topk_weights = topk_weights.unsqueeze(-1)  # (B*T, num_experts_per_tok, 1)
-        y = y * topk_weights  # (B, T, num_experts_per_tok, C)
-
-        # Sum the experts' outputs
-        y = y.sum(dim=2)  # (B, T, C)
+        y = (y * topk_weights).sum(dim=2)  # (B, T, C)
 
         # Initialize auxiliary loss
         self.auxiliary_loss = torch.tensor(0.0, device=x.device)
 
-
         if self.moe_loss:
             with torch.no_grad():
-                # One-hot encoding of expert assignments
                 one_hot = F.one_hot(flat_expert_indices, num_classes=self.num_experts).type_as(scores)
-                # Compute the average usage of each expert
-                expert_usage = one_hot.sum(dim=0) / x_flat.size(0)  # (num_experts,)
+                expert_usage = one_hot.sum(dim=0) / x_flat.size(0)
 
                 if self.moe_loss_type == "variance_penalty":
-                    # Load Balancing Loss: Variance of expert usage
                     mean_usage = expert_usage.mean()
                     variance = torch.mean((expert_usage - mean_usage) ** 2)
                     self.auxiliary_loss = self.moe_loss_coef * variance
 
                 elif self.moe_loss_type == "entropy_regularization":
-                    # Entropy Regularization: Maximize entropy of expert usage
                     entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
-                    # We want to maximize entropy, so minimize negative entropy
                     self.auxiliary_loss = self.moe_loss_coef * (-entropy)
 
                 elif self.moe_loss_type == "diversity_regularization":
-                    # Diversity Regularization: Encourage uniform distribution of expert assignments
                     uniform = torch.ones_like(expert_usage) / self.num_experts
                     divergence = F.kl_div((expert_usage + 1e-10).log(), uniform, reduction='sum')
                     self.auxiliary_loss = self.moe_loss_coef * divergence
@@ -481,28 +454,12 @@ class MoE(nn.Module):
         return y
 
     def get_auxiliary_loss(self) -> torch.Tensor:
-        """
-        Retrieves the computed auxiliary loss.
-        
-        Returns:
-            torch.Tensor: Auxiliary loss tensor.
-        """
         return self.auxiliary_loss
 
     def get_usage_counts(self) -> torch.Tensor:
-        """
-        Retrieves the expert usage counts.
-        
-        Returns:
-            torch.Tensor: Tensor containing usage counts for each expert.
-        """
         return self.expert_usage_counts
 
     def reset_usage_counts(self):
-        """
-        Resets the expert usage counts and total assignments.
-        Call this method after logging to start fresh statistics.
-        """
         self.expert_usage_counts.zero_()
         self.total_assignments = 0
 
@@ -971,82 +928,24 @@ class GPTLMHeadModel(GPT):
                 cross_attentions=outputs.cross_attentions,
             )
 
-class MoEUsageLoggingCallback(TrainerCallback):
-    """
-    A custom callback for Hugging Face's Trainer to log Mixture of Experts (MoE) usage statistics.
-    """
-    def __init__(self, logger: Optional[logging.Logger] = None, log_interval: int = 100):
-        """
-        Initializes the callback.
 
-        Args:
-            logger (logging.Logger, optional): Logger instance. If None, the root logger is used.
-            log_interval (int): Number of training steps between logs.
-        """
+
+
+# Adjusted MoEUsageLoggingCallback to ensure correct parameter signatures
+class MoEUsageLoggingCallback(TrainerCallback):
+    def __init__(self, trainer: Trainer, logger: Optional[logging.Logger] = None, log_interval: int = 100):
         super().__init__()
         self.log_interval = log_interval
         self.steps_since_last_log = 0
         self.logger = logger or logging.getLogger(__name__)
-    
-    def on_step_end(
-        self,
-        args: "TrainingArguments",
-        state: TrainerState,
-        control: TrainerControl,
-        trainer: Trainer,
-        **kwargs,
-    ) -> None:
-        """
-        Called at the end of a training step.
+        self.trainer = trainer  # Store the trainer instance
 
-        Args:
-            args (TrainingArguments): Training arguments.
-            state (TrainerState): State information.
-            control (TrainerControl): Control flags.
-            trainer (Trainer): The Trainer instance.
-            **kwargs: Additional arguments.
-        """
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # print(f"Callback invoked on step end. Step: {state.global_step}")  # Debug print
         self.steps_since_last_log += 1
         if self.steps_since_last_log >= self.log_interval:
-            model = trainer.model
-            if model is not None:
-                moe_layers = self._get_moe_layers(model)
-                for idx, moe in enumerate(moe_layers):
-                    usage_counts = moe.get_usage_counts()
-                    total_assignments = moe.total_assignments
-                    if total_assignments > 0:
-                        usage_percentages = (usage_counts.float() / total_assignments * 100).cpu().numpy()
-                    else:
-                        usage_percentages = usage_counts.cpu().numpy()
-                    
-                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(moe.num_experts)])
-                    self.logger.info(f"MoE Layer {idx + 1} Usage: {usage_str}")
-                    
-                    # Optionally, reset counts after logging
-                    moe.reset_usage_counts()
-            
-            self.steps_since_last_log = 0
-
-    def on_epoch_end(
-        self,
-        args: "TrainingArguments",
-        state: TrainerState,
-        control: TrainerControl,
-        trainer: Trainer,
-        **kwargs,
-    ) -> None:
-        """
-        Called at the end of an epoch.
-
-        Args:
-            args (TrainingArguments): Training arguments.
-            state (TrainerState): State information.
-            control (TrainerControl): Control flags.
-            trainer (Trainer): The Trainer instance.
-            **kwargs: Additional arguments.
-        """
-        model = trainer.model
-        if model is not None:
+            print("Logging MoE usage stats...")  # Debug print
+            model = self.trainer.model  # Access the model directly from the trainer instance
             moe_layers = self._get_moe_layers(model)
             for idx, moe in enumerate(moe_layers):
                 usage_counts = moe.get_usage_counts()
@@ -1055,68 +954,35 @@ class MoEUsageLoggingCallback(TrainerCallback):
                     usage_percentages = (usage_counts.float() / total_assignments * 100).cpu().numpy()
                 else:
                     usage_percentages = usage_counts.cpu().numpy()
-                
+
                 usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(moe.num_experts)])
-                self.logger.info(f"End of Epoch MoE Layer {idx + 1} Usage: {usage_str}")
-                
-                # Optionally, reset counts after logging
+                self.logger.info(f"MoE Layer {idx + 1} Usage: {usage_str}")
+
                 moe.reset_usage_counts()
-    
+
+            self.steps_since_last_log = 0
+
     def _get_moe_layers(self, model) -> list:
-        """
-        Retrieves all MoE layers from the model.
-
-        Args:
-            model: The model instance.
-
-        Returns:
-            list: A list of MoE layer instances.
-        """
         moe_layers = []
         for block in model.transformer.h:
-            if isinstance(block.mlp, MoE):
+            if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
                 moe_layers.append(block.mlp)
         return moe_layers
+    
+    from transformers import TrainerCallback
 
-class MoEUsageTensorBoardCallback(TrainerCallback):
-    """
-    A custom callback for Hugging Face's Trainer to log Mixture of Experts (MoE) usage statistics to TensorBoard.
-    """
-    def __init__(self, log_interval: int = 100, tb_writer: Optional[SummaryWriter] = None):
-        """
-        Initializes the callback.
-
-        Args:
-            log_interval (int): Number of training steps between logs.
-            tb_writer (SummaryWriter, optional): TensorBoard SummaryWriter instance. If None, a default writer is created.
-        """
+class MoETensorBoardLoggingCallback(TrainerCallback):
+    def __init__(self, log_dir: str = './logs_tensorboard', log_interval: int = 100):
         super().__init__()
         self.log_interval = log_interval
         self.steps_since_last_log = 0
-        self.tb_writer = tb_writer or SummaryWriter()
-    
-    def on_step_end(
-        self,
-        args: "TrainingArguments",
-        state: TrainerState,
-        control: TrainerControl,
-        trainer: Trainer,
-        **kwargs,
-    ) -> None:
-        """
-        Called at the end of a training step.
+        self.writer = SummaryWriter(log_dir)  # Initialize TensorBoard writer
 
-        Args:
-            args (TrainingArguments): Training arguments.
-            state (TrainerState): State information.
-            control (TrainerControl): Control flags.
-            trainer (Trainer): The Trainer instance.
-            **kwargs: Additional arguments.
-        """
+    def on_step_end(self, args, state, control, **kwargs):
         self.steps_since_last_log += 1
         if self.steps_since_last_log >= self.log_interval:
-            model = trainer.model
-            if model is not None:
+            model = kwargs.get('model')  # Get the model from kwargs
+            if model:
                 moe_layers = self._get_moe_layers(model)
                 for idx, moe in enumerate(moe_layers):
                     usage_counts = moe.get_usage_counts()
@@ -1125,49 +991,24 @@ class MoEUsageTensorBoardCallback(TrainerCallback):
                         usage_percentages = (usage_counts.float() / total_assignments * 100).cpu().numpy()
                     else:
                         usage_percentages = usage_counts.cpu().numpy()
-                    
-                    for expert_id, usage_pct in enumerate(usage_percentages):
-                        tag = f"MoE_Layer_{idx+1}/Expert_{expert_id}_Usage_Percentage"
-                        self.tb_writer.add_scalar(tag, usage_pct, state.global_step)
-                
-                # Optionally, reset counts after logging
-                for moe in moe_layers:
+
+                    # Log usage stats for each expert to TensorBoard
+                    for i in range(moe.num_experts):
+                        self.writer.add_scalar(f"MoE_Layer_{idx + 1}_Expert_{i}_Usage", usage_percentages[i], state.global_step)
+
+                    # Reset expert usage counts after logging
                     moe.reset_usage_counts()
-            
+
             self.steps_since_last_log = 0
 
-    def on_train_end(
-        self,
-        args: "TrainingArguments",
-        state: TrainerState,
-        control: TrainerControl,
-        trainer: Trainer,
-        **kwargs,
-    ) -> None:
-        """
-        Called at the end of training.
-
-        Args:
-            args (TrainingArguments): Training arguments.
-            state (TrainerState): State information.
-            control (TrainerControl): Control flags.
-            trainer (Trainer): The Trainer instance.
-            **kwargs: Additional arguments.
-        """
-        self.tb_writer.close()
-    
     def _get_moe_layers(self, model) -> list:
-        """
-        Retrieves all MoE layers from the model.
-
-        Args:
-            model: The model instance.
-
-        Returns:
-            list: A list of MoE layer instances.
-        """
+        """Helper function to get all MoE layers from the model."""
         moe_layers = []
         for block in model.transformer.h:
-            if isinstance(block.mlp, MoE):
+            if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
                 moe_layers.append(block.mlp)
         return moe_layers
+
+    def on_train_end(self, args, state, control, **kwargs):
+        # Close the TensorBoard writer when training ends
+        self.writer.close()

@@ -10,3 +10,8 @@ __pycache__/
 input.txt
 env/
 venv/
+logs
+results\checkpoint-250
+results
+training.log
+.gitignore
