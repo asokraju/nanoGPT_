@@ -209,7 +209,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
