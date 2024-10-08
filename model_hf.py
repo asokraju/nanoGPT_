@@ -994,6 +994,16 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
         self.trainer = trainer
         self.logger = logger or logging.getLogger(__name__)
 
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Reset expert usage counts at the beginning of training
+        model = self.trainer.model
+        if model:
+            moe_layers = self._get_moe_layers(model)
+            for moe in moe_layers:
+                moe.reset_usage_counts()
+                # Also reset auxiliary loss if necessary
+                moe.auxiliary_loss = torch.tensor(0.0, device=moe.auxiliary_loss.device)
+
     def on_step_end(self, args, state, control, **kwargs):
         self.steps_since_last_log += 1
         if self.steps_since_last_log >= self.log_interval:
@@ -1022,6 +1032,7 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
 
                     # Reset expert usage counts after logging
                     moe.reset_usage_counts()
+                    moe.auxiliary_loss = torch.tensor(0.0, device=moe.auxiliary_loss.device)
 
             self.steps_since_last_log = 0
 
@@ -1033,4 +1044,5 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
         return moe_layers
 
     def on_train_end(self, args, state, control, **kwargs):
+        # Close the TensorBoard writer when training ends
         self.writer.close()
