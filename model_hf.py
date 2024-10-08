@@ -245,8 +245,8 @@ class GPTConfig(PretrainedConfig):
         num_experts: int = 8,
         num_experts_per_tok: int = 2,
         moe_loss: bool = True,  # Option to enable/disable MoE loss
-        moe_loss_type: str = "entropy_regularization",  # Type of load balancing loss entropy_regularization variance_penalty
-        moe_loss_coef: float = 1e1,  # Coefficient for the auxiliary loss
+        moe_loss_type: str = "entropy_regularization",  # Type of load balancing loss "variance_penalty", "entropy_regularization", "diversity_regularization"
+        moe_loss_coef: float = 1e0,  # Coefficient for the auxiliary loss
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -509,7 +509,13 @@ class MoE(nn.Module):
             elif self.moe_loss_type == "entropy_regularization":
                 # Compute entropy of expert usage
                 entropy: torch.Tensor = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
-                self.auxiliary_loss = self.moe_loss_coef * entropy  # Maximize entropy
+                # Compute maximum possible entropy
+                max_entropy = torch.log(torch.tensor(float(self.num_experts), dtype=x.dtype, device=x.device))
+                # Normalize entropy to range between 0 and 1
+                normalized_entropy = entropy / max_entropy
+                # To maximize entropy, minimize negative entropy
+                self.auxiliary_loss = -self.moe_loss_coef * normalized_entropy
+
 
             elif self.moe_loss_type == "diversity_regularization":
                 # Compute KL divergence between expert usage and uniform distribution
