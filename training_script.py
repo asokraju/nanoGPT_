@@ -8,7 +8,7 @@ from model_hf import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback, MoETens
 
 # Define a small synthetic dataset for debugging
 class SyntheticDataset(Dataset):
-    def __init__(self, vocab_size: int, block_size: int, num_samples: int = 1000):
+    def __init__(self, vocab_size: int, block_size: int, num_samples: int = 10000):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.num_samples = num_samples
@@ -64,9 +64,6 @@ training_args = TrainingArguments(
     report_to=["tensorboard"],
 )
 
-# Initialize the custom callback
-# moe_logging_callback = MoEUsageLoggingCallback(logger=logger, log_interval=1)
-
 # Initialize the Trainer
 trainer = Trainer(
     model=model,
@@ -74,10 +71,10 @@ trainer = Trainer(
     train_dataset=dataset,
     # callbacks=[moe_logging_callback],
 )
-moe_logging_callback = MoEUsageLoggingCallback(trainer=trainer, logger=logger, log_interval=10)
-tensorboard_logging_callback = MoETensorBoardLoggingCallback(log_dir='./logs/moe_logs', log_interval=10)
+moe_logging_callback = MoEUsageLoggingCallback(trainer=trainer, logger=logger, log_interval=10, log_dir='./logs/moe_logs')
+# tensorboard_logging_callback = MoETensorBoardLoggingCallback(trainer=trainer, log_dir='./logs/moe_logs', log_interval=10)
 trainer.add_callback(moe_logging_callback)
-trainer.add_callback(tensorboard_logging_callback)
+# trainer.add_callback(tensorboard_logging_callback)
 
 # Train the model
 trainer.train()

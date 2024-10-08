@@ -396,11 +396,14 @@ class MoE(nn.Module):
         # Compute gating scores
         scores = self.gate(x_flat)  # (B*T, num_experts)
 
+        # Compute gating probabilities using softmax
+        gating_probs = F.softmax(scores, dim=-1)  # (B*T, num_experts)
+
         # Select top-k experts
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, num_experts_per_tok)
 
         # Softmax the top-k scores to get weights
-        topk_weights = F.softmax(topk_scores, dim=-1).view(B, T, self.num_experts_per_tok, 1)  # (B, T, num_experts_per_tok, 1)
+        topk_weights = F.softmax(topk_scores, dim=-1).view(-1, self.num_experts_per_tok, 1)  # (B*T, num_experts_per_tok, 1)
 
         # Flatten the expert indices
         flat_expert_indices = topk_indices.view(-1)  # (B*T*num_experts_per_tok,)
@@ -423,33 +426,35 @@ class MoE(nn.Module):
             if mask.any():
                 y[mask] = expert(x_repeated[mask])
 
-        # Reshape y to (B, T, num_experts_per_tok, C)
-        y = y.view(B, T, self.num_experts_per_tok, C)
+        # Reshape y to (B*T, num_experts_per_tok, C)
+        y = y.view(-1, self.num_experts_per_tok, C)
 
         # Apply the weights
-        y = (y * topk_weights).sum(dim=2)  # (B, T, C)
+        y = (y * topk_weights).sum(dim=1)  # (B*T, C)
 
-        # Initialize auxiliary loss
+        # Reshape back to (B, T, C)
+        y = y.view(B, T, C)
+
+        # Compute auxiliary loss using gating probabilities
         self.auxiliary_loss = torch.tensor(0.0, device=x.device)
 
         if self.moe_loss:
-            with torch.no_grad():
-                one_hot = F.one_hot(flat_expert_indices, num_classes=self.num_experts).type_as(scores)
-                expert_usage = one_hot.sum(dim=0) / x_flat.size(0)
+            # Use gating probabilities for expert usage to allow gradient flow
+            expert_usage = gating_probs.mean(dim=0)  # Average over all tokens
 
-                if self.moe_loss_type == "variance_penalty":
-                    mean_usage = expert_usage.mean()
-                    variance = torch.mean((expert_usage - mean_usage) ** 2)
-                    self.auxiliary_loss = self.moe_loss_coef * variance
+            if self.moe_loss_type == "variance_penalty":
+                mean_usage = expert_usage.mean()
+                variance = torch.mean((expert_usage - mean_usage) ** 2)
+                self.auxiliary_loss = self.moe_loss_coef * variance
 
-                elif self.moe_loss_type == "entropy_regularization":
-                    entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
-                    self.auxiliary_loss = self.moe_loss_coef * (-entropy)
+            elif self.moe_loss_type == "entropy_regularization":
+                entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
+                self.auxiliary_loss = self.moe_loss_coef * entropy  # Maximize entropy
 
-                elif self.moe_loss_type == "diversity_regularization":
-                    uniform = torch.ones_like(expert_usage) / self.num_experts
-                    divergence = F.kl_div((expert_usage + 1e-10).log(), uniform, reduction='sum')
-                    self.auxiliary_loss = self.moe_loss_coef * divergence
+            elif self.moe_loss_type == "diversity_regularization":
+                uniform = torch.ones_like(expert_usage) / self.num_experts
+                divergence = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
+                self.auxiliary_loss = self.moe_loss_coef * divergence
 
         return y
 
@@ -885,9 +890,10 @@ class GPTLMHeadModel(GPT):
 
         hidden_states = outputs.last_hidden_state  # (B, T, C)
 
+        # Compute logits
+        logits = self.lm_head(hidden_states)  # (B, T, vocab_size)
+
         if labels is not None:
-            # Compute logits
-            logits = self.lm_head(hidden_states)  # (B, T, vocab_size)
             # Shift logits and labels for next-token prediction
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
@@ -899,7 +905,7 @@ class GPTLMHeadModel(GPT):
             )
 
             # Initialize auxiliary loss
-            aux_loss = 0.0
+            aux_loss = torch.tensor(0.0, device=logits.device)
 
             if self.config.use_moe:
                 # Aggregate auxiliary losses from all MoE layers
@@ -919,7 +925,7 @@ class GPTLMHeadModel(GPT):
             )
         else:
             # Return only the logits for the last token
-            logits = self.lm_head(hidden_states[:, -1, :]).unsqueeze(1)  # (B, 1, vocab_size)
+            logits = logits[:, -1, :].unsqueeze(1)  # (B, 1, vocab_size)
             return CausalLMOutputWithCrossAttentions(
                 loss=None,
                 logits=logits,
@@ -931,14 +937,16 @@ class GPTLMHeadModel(GPT):
 
 
 
+
 # Adjusted MoEUsageLoggingCallback to ensure correct parameter signatures
 class MoEUsageLoggingCallback(TrainerCallback):
-    def __init__(self, trainer: Trainer, logger: Optional[logging.Logger] = None, log_interval: int = 100):
+    def __init__(self, trainer: Trainer, logger: Optional[logging.Logger] = None, log_interval: int = 100, log_dir: str = './logs_tensorboard'):
         super().__init__()
         self.log_interval = log_interval
         self.steps_since_last_log = 0
         self.logger = logger or logging.getLogger(__name__)
         self.trainer = trainer  # Store the trainer instance
+        self.writer = SummaryWriter(log_dir)
 
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         # print(f"Callback invoked on step end. Step: {state.global_step}")  # Debug print
@@ -957,7 +965,12 @@ class MoEUsageLoggingCallback(TrainerCallback):
 
                 usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(moe.num_experts)])
                 self.logger.info(f"MoE Layer {idx + 1} Usage: {usage_str}")
-
+                # Log to TensorBoard
+                for i in range(moe.num_experts):
+                    self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Expert_{i}_Usage", usage_percentages[i], state.global_step)
+                # Log auxiliary loss
+                aux_loss = moe.get_auxiliary_loss().item()
+                self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Auxiliary_Loss", aux_loss, state.global_step)
                 moe.reset_usage_counts()
 
             self.steps_since_last_log = 0
@@ -969,19 +982,22 @@ class MoEUsageLoggingCallback(TrainerCallback):
                 moe_layers.append(block.mlp)
         return moe_layers
     
-    from transformers import TrainerCallback
+    def on_train_end(self, args, state, control, **kwargs):
+        self.writer.close()
 
 class MoETensorBoardLoggingCallback(TrainerCallback):
-    def __init__(self, log_dir: str = './logs_tensorboard', log_interval: int = 100):
+    def __init__(self, trainer, log_dir: str = './logs_tensorboard', log_interval: int = 100, logger=None):
         super().__init__()
         self.log_interval = log_interval
         self.steps_since_last_log = 0
-        self.writer = SummaryWriter(log_dir)  # Initialize TensorBoard writer
+        self.writer = SummaryWriter(log_dir)
+        self.trainer = trainer
+        self.logger = logger or logging.getLogger(__name__)
 
     def on_step_end(self, args, state, control, **kwargs):
         self.steps_since_last_log += 1
         if self.steps_since_last_log >= self.log_interval:
-            model = kwargs.get('model')  # Get the model from kwargs
+            model = self.trainer.model
             if model:
                 moe_layers = self._get_moe_layers(model)
                 for idx, moe in enumerate(moe_layers):
@@ -992,9 +1008,17 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
                     else:
                         usage_percentages = usage_counts.cpu().numpy()
 
-                    # Log usage stats for each expert to TensorBoard
+                    # Log to console
+                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(moe.num_experts)])
+                    self.logger.info(f"MoE Layer {idx + 1} Usage: {usage_str}")
+
+                    # Log to TensorBoard
                     for i in range(moe.num_experts):
-                        self.writer.add_scalar(f"MoE_Layer_{idx + 1}_Expert_{i}_Usage", usage_percentages[i], state.global_step)
+                        self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Expert_{i}_Usage", usage_percentages[i], state.global_step)
+
+                    # Log auxiliary loss
+                    aux_loss = moe.get_auxiliary_loss().item()
+                    self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Auxiliary_Loss", aux_loss, state.global_step)
 
                     # Reset expert usage counts after logging
                     moe.reset_usage_counts()
@@ -1002,7 +1026,6 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
             self.steps_since_last_log = 0
 
     def _get_moe_layers(self, model) -> list:
-        """Helper function to get all MoE layers from the model."""
         moe_layers = []
         for block in model.transformer.h:
             if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
@@ -1010,5 +1033,4 @@ class MoETensorBoardLoggingCallback(TrainerCallback):
         return moe_layers
 
     def on_train_end(self, args, state, control, **kwargs):
-        # Close the TensorBoard writer when training ends
         self.writer.close()
