@@ -4,7 +4,7 @@ from transformers import TrainingArguments, Trainer
 from typing import Optional
 import logging
 from torch.utils.tensorboard import SummaryWriter
-from model_hf import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback, MoETensorBoardLoggingCallback
+from model_hf import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback
 
 # Define a small synthetic dataset for debugging
 class SyntheticDataset(Dataset):
@@ -44,6 +44,8 @@ config = GPTConfig(
     num_experts=4,
     num_experts_per_tok=2,
     moe_loss=True,
+    moe_loss_type = "entropy_regularization",  # Type of load balancing loss "variance_penalty", "entropy_regularization", "diversity_regularization"
+    moe_loss_coef = 1e0, 
 )
 
 # Initialize the model
@@ -72,9 +74,7 @@ trainer = Trainer(
     # callbacks=[moe_logging_callback],
 )
 moe_logging_callback = MoEUsageLoggingCallback(trainer=trainer, logger=logger, log_interval=10, log_dir='./logs/moe_logs')
-# tensorboard_logging_callback = MoETensorBoardLoggingCallback(trainer=trainer, log_dir='./logs/moe_logs', log_interval=10)
 trainer.add_callback(moe_logging_callback)
-# trainer.add_callback(tensorboard_logging_callback)
 
 # Train the model
 trainer.train()
