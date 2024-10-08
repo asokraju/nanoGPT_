@@ -986,14 +986,20 @@ class GPTLMHeadModel(GPT):
                 ignore_index=-1
             )
 
-            # Initialize auxiliary loss
-            aux_loss = torch.tensor(0.0, device=logits.device)
+            # Initialize list to collect auxiliary losses
+            aux_losses = []
 
             if self.config.use_moe:
-                # Aggregate auxiliary losses from all MoE layers
+                # Collect auxiliary losses from all MoE layers
                 for block in self.transformer.h:
                     if isinstance(block.mlp, MoE):
-                        aux_loss += block.mlp.get_auxiliary_loss()
+                        aux_losses.append(block.mlp.get_auxiliary_loss())
+
+            # Compute the average auxiliary loss
+            if aux_losses:
+                aux_loss = torch.stack(aux_losses).mean()
+            else:
+                aux_loss = torch.tensor(0.0, device=logits.device)
 
             # Combine losses
             total_loss = primary_loss + aux_loss
@@ -1005,16 +1011,7 @@ class GPTLMHeadModel(GPT):
                 attentions=outputs.attentions,
                 cross_attentions=outputs.cross_attentions,
             )
-        else:
-            # Return only the logits for the last token
-            logits = logits[:, -1, :].unsqueeze(1)  # (B, 1, vocab_size)
-            return CausalLMOutputWithCrossAttentions(
-                loss=None,
-                logits=logits,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-                cross_attentions=outputs.cross_attentions,
-            )
+
 
 
 
