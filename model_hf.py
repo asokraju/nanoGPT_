@@ -245,8 +245,8 @@ class GPTConfig(PretrainedConfig):
         num_experts: int = 8,
         num_experts_per_tok: int = 2,
         moe_loss: bool = True,  # Option to enable/disable MoE loss
-        moe_loss_type: str = "variance_penalty",  # Type of load balancing loss
-        moe_loss_coef: float = 1e-3,  # Coefficient for the auxiliary loss
+        moe_loss_type: str = "entropy_regularization",  # Type of load balancing loss entropy_regularization variance_penalty
+        moe_loss_coef: float = 1e1,  # Coefficient for the auxiliary loss
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -371,100 +371,176 @@ class MLP(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
-        self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
-        self.moe_loss = config.moe_loss
-        self.moe_loss_type = config.moe_loss_type
-        self.moe_loss_coef = config.moe_loss_coef
+    """
+    Mixture of Experts (MoE) layer implementation for transformer models.
 
-        # Validate loss type
-        valid_loss_types = ["variance_penalty", "entropy_regularization", "diversity_regularization"]
+    Args:
+        config (GPTConfig): Configuration object containing model parameters.
+
+    Attributes:
+        num_experts (int): Total number of experts.
+        num_experts_per_tok (int): Number of experts assigned per token.
+        experts (nn.ModuleList): List of expert modules (e.g., MLPs).
+        gate (nn.Linear): Gating network mapping input embeddings to expert scores.
+        moe_loss (bool): Flag to enable or disable auxiliary loss.
+        moe_loss_type (str): Type of auxiliary loss to use.
+        moe_loss_coef (float): Coefficient for scaling the auxiliary loss.
+        expert_usage_counts (torch.Tensor): Counts of expert usage for monitoring.
+        total_assignments (int): Total number of expert assignments.
+        auxiliary_loss (torch.Tensor): The auxiliary loss computed during the forward pass.
+    """
+
+    def __init__(self, config: GPTConfig) -> None:
+        """
+        Initializes the MoE layer.
+
+        Args:
+            config (GPTConfig): Configuration object with model parameters.
+
+        Raises:
+            AssertionError: If an invalid moe_loss_type is specified.
+        """
+        super().__init__()
+        self.num_experts: int = config.num_experts
+        self.num_experts_per_tok: int = config.num_experts_per_tok
+        self.experts: nn.ModuleList = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        self.gate: nn.Linear = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.moe_loss: bool = config.moe_loss
+        self.moe_loss_type: str = config.moe_loss_type
+        self.moe_loss_coef: float = config.moe_loss_coef
+
+        # Validate the loss type
+        valid_loss_types: List[str] = ["variance_penalty", "entropy_regularization", "diversity_regularization"]
         assert self.moe_loss_type in valid_loss_types, f"Invalid moe_loss_type. Choose from {valid_loss_types}"
 
-        # Initialize expert usage counters
+        # Initialize expert usage counters for monitoring purposes
         self.register_buffer("expert_usage_counts", torch.zeros(self.num_experts, dtype=torch.long))
-        self.total_assignments = 0  # Total number of expert assignments
+        self.total_assignments: int = 0  # Total number of expert assignments
+
+        # Initialize auxiliary loss (to be computed in forward)
+        self.auxiliary_loss: torch.Tensor = torch.tensor(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the MoE layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, T, C).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, T, C).
+        """
+        # Get batch size (B), sequence length (T), and embedding dimension (C)
         B, T, C = x.size()
-        x_flat = x.view(-1, C)  # (B*T, C)
 
-        # Compute gating scores
-        scores = self.gate(x_flat)  # (B*T, num_experts)
+        # Flatten the input to shape (B*T, C)
+        x_flat: torch.Tensor = x.view(-1, C)
 
-        # Compute gating probabilities using softmax
-        gating_probs = F.softmax(scores, dim=-1)  # (B*T, num_experts)
+        # Compute gating scores: shape (B*T, num_experts)
+        scores: torch.Tensor = self.gate(x_flat)
 
-        # Select top-k experts
+        # Compute gating probabilities using softmax over the experts dimension
+        gating_probs: torch.Tensor = F.softmax(scores, dim=-1)  # (B*T, num_experts)
+
+        # Select top-k experts per token based on gating scores
+        topk_scores: torch.Tensor
+        topk_indices: torch.Tensor
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, num_experts_per_tok)
 
-        # Softmax the top-k scores to get weights
-        topk_weights = F.softmax(topk_scores, dim=-1).view(-1, self.num_experts_per_tok, 1)  # (B*T, num_experts_per_tok, 1)
+        # Apply softmax to the top-k scores to get normalized weights
+        topk_weights: torch.Tensor = F.softmax(topk_scores, dim=-1).view(-1, self.num_experts_per_tok, 1)  # (B*T, num_experts_per_tok, 1)
 
-        # Flatten the expert indices
-        flat_expert_indices = topk_indices.view(-1)  # (B*T*num_experts_per_tok,)
+        # Flatten the expert indices for indexing
+        flat_expert_indices: torch.Tensor = topk_indices.view(-1)  # (B*T*num_experts_per_tok,)
 
-        # Update expert usage counts
+        # Update expert usage counts for monitoring (not used in training)
         with torch.no_grad():
-            counts = flat_expert_indices.bincount(minlength=self.num_experts)
+            counts: torch.Tensor = flat_expert_indices.bincount(minlength=self.num_experts)
             self.expert_usage_counts += counts
             self.total_assignments += flat_expert_indices.size(0)
 
         # Repeat inputs for each expert assignment
-        x_repeated = x_flat.unsqueeze(1).repeat(1, self.num_experts_per_tok, 1).view(-1, C)  # (B*T*num_experts_per_tok, C)
+        x_repeated: torch.Tensor = x_flat.unsqueeze(1).repeat(1, self.num_experts_per_tok, 1).view(-1, C)  # (B*T*num_experts_per_tok, C)
 
-        # Initialize output tensor
-        y = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
+        # Initialize the output tensor y
+        y: torch.Tensor = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
 
         # Apply each expert to its assigned inputs
         for i, expert in enumerate(self.experts):
-            mask = flat_expert_indices == i  # (B*T*num_experts_per_tok,)
+            # Create a mask for the current expert
+            mask: torch.Tensor = flat_expert_indices == i  # (B*T*num_experts_per_tok,)
             if mask.any():
+                # Apply the expert to the inputs where the mask is True
                 y[mask] = expert(x_repeated[mask])
 
         # Reshape y to (B*T, num_experts_per_tok, C)
         y = y.view(-1, self.num_experts_per_tok, C)
 
-        # Apply the weights
+        # Apply the top-k weights to the expert outputs and sum over experts
         y = (y * topk_weights).sum(dim=1)  # (B*T, C)
 
-        # Reshape back to (B, T, C)
+        # Reshape y back to (B, T, C)
         y = y.view(B, T, C)
 
-        # Compute auxiliary loss using gating probabilities
+        # Initialize auxiliary loss
         self.auxiliary_loss = torch.tensor(0.0, device=x.device)
 
         if self.moe_loss:
-            # Use gating probabilities for expert usage to allow gradient flow
-            expert_usage = gating_probs.mean(dim=0)  # Average over all tokens
+            # Compute assigned probabilities after top-k selection
+            # Initialize assigned_probs tensor of shape (B*T, num_experts)
+            assigned_probs: torch.Tensor = torch.zeros(B * T, self.num_experts, device=x.device)
 
+            # Flatten top-k weights to shape (B*T, num_experts_per_tok)
+            flat_topk_weights: torch.Tensor = topk_weights.squeeze(-1)  # (B*T, num_experts_per_tok)
+
+            # Scatter the top-k weights into the assigned_probs tensor
+            assigned_probs.scatter_(dim=1, index=topk_indices, src=flat_topk_weights)
+
+            # Compute expert usage as the mean over all tokens
+            expert_usage: torch.Tensor = assigned_probs.mean(dim=0)  # (num_experts,)
+
+            # Compute auxiliary loss based on the specified moe_loss_type
             if self.moe_loss_type == "variance_penalty":
-                mean_usage = expert_usage.mean()
-                variance = torch.mean((expert_usage - mean_usage) ** 2)
+                # Compute variance of expert usage
+                mean_usage: torch.Tensor = expert_usage.mean()
+                variance: torch.Tensor = torch.mean((expert_usage - mean_usage) ** 2)
                 self.auxiliary_loss = self.moe_loss_coef * variance
 
             elif self.moe_loss_type == "entropy_regularization":
-                entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
+                # Compute entropy of expert usage
+                entropy: torch.Tensor = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
                 self.auxiliary_loss = self.moe_loss_coef * entropy  # Maximize entropy
 
             elif self.moe_loss_type == "diversity_regularization":
-                uniform = torch.ones_like(expert_usage) / self.num_experts
-                divergence = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
+                # Compute KL divergence between expert usage and uniform distribution
+                uniform: torch.Tensor = torch.ones_like(expert_usage) / self.num_experts
+                divergence: torch.Tensor = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
                 self.auxiliary_loss = self.moe_loss_coef * divergence
 
         return y
 
     def get_auxiliary_loss(self) -> torch.Tensor:
+        """
+        Returns the auxiliary loss computed during the forward pass.
+
+        Returns:
+            torch.Tensor: The auxiliary loss tensor.
+        """
         return self.auxiliary_loss
 
     def get_usage_counts(self) -> torch.Tensor:
+        """
+        Returns the counts of expert usage.
+
+        Returns:
+            torch.Tensor: A tensor containing the usage counts of each expert.
+        """
         return self.expert_usage_counts
 
-    def reset_usage_counts(self):
+    def reset_usage_counts(self) -> None:
+        """
+        Resets the expert usage counts and total assignments.
+        """
         self.expert_usage_counts.zero_()
         self.total_assignments = 0
 
