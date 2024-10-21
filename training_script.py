@@ -49,7 +49,13 @@ config = GPTConfig(
 )
 
 # Initialize the model
-model = GPTLMHeadModel(config)
+resume = True
+ckpt_path='results\checkpoint-500'
+if resume:
+    model = GPTLMHeadModel.from_pretrained(pretrained_model_name_or_path=ckpt_path,
+                                           local_files_only=True,                                           device_map='cuda')
+else:
+    model = GPTLMHeadModel(config)
 
 # Prepare the synthetic dataset
 dataset = SyntheticDataset(vocab_size=config.vocab_size, block_size=config.block_size)
@@ -77,4 +83,7 @@ moe_logging_callback = MoEUsageLoggingCallback(trainer=trainer, logger=logger, l
 trainer.add_callback(moe_logging_callback)
 
 # Train the model
-trainer.train()
+if resume:
+    trainer.train(resume_from_checkpoint=ckpt_path)
+else:
+    trainer.train()

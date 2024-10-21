@@ -748,23 +748,6 @@ class GPTLMHeadModel(GPT):
         """
         Forward pass for the GPTLMHeadModel.
         Computes the logits and optionally the loss if labels are provided.
-        
-        Args:
-            input_ids (torch.Tensor): Input token IDs of shape (B, T)
-            attention_mask (Optional[torch.Tensor]): Attention mask of shape (B, T)
-            labels (Optional[torch.Tensor]): Labels for computing the loss
-            return_dict (Optional[bool]): Whether to return a dict
-            past_key_values (Optional[torch.Tensor]): Past key values for caching
-            head_mask (Optional[torch.FloatTensor]): Mask for attention heads
-            inputs_embeds (Optional[torch.FloatTensor]): Input embeddings
-            encoder_hidden_states (Optional[torch.Tensor]): Encoder hidden states
-            encoder_attention_mask (Optional[torch.FloatTensor]): Encoder attention mask
-            use_cache (Optional[bool]): Whether to use caching
-            output_attentions (Optional[bool]): Whether to output attentions
-            output_hidden_states (Optional[bool]): Whether to output hidden states
-        
-        Returns:
-            CausalLMOutputWithCrossAttentions: Model outputs including logits and loss
         """
         outputs = super().forward(
             input_ids=input_ids,
@@ -786,42 +769,52 @@ class GPTLMHeadModel(GPT):
         # Compute logits
         logits = self.lm_head(hidden_states)  # (B, T, vocab_size)
 
-        if labels is not None:
-            # Shift logits and labels for next-token prediction
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            # Compute primary loss
-            primary_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-1
-            )
-
-            # Initialize list to collect auxiliary losses
-            aux_losses = []
-
-            if self.config.use_moe:
-                # Collect auxiliary losses from all MoE layers
-                for block in self.transformer.h:
-                    if isinstance(block.mlp, MoE):
-                        aux_losses.append(block.mlp.get_auxiliary_loss())
-
-            # Compute the average auxiliary loss
-            if aux_losses:
-                aux_loss = torch.stack(aux_losses).mean()
-            else:
-                aux_loss = torch.tensor(0.0, device=logits.device)
-
-            # Combine losses
-            total_loss = primary_loss + aux_loss
-
+        # If we are generating text (no labels provided), just return logits
+        if labels is None:
             return CausalLMOutputWithCrossAttentions(
-                loss=total_loss,
                 logits=logits,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
                 cross_attentions=outputs.cross_attentions,
             )
+
+        # Shift logits and labels for next-token prediction when labels are provided
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        
+        # Compute primary loss
+        primary_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-1
+        )
+
+        # Initialize list to collect auxiliary losses
+        aux_losses = []
+
+        if self.config.use_moe:
+            # Collect auxiliary losses from all MoE layers
+            for block in self.transformer.h:
+                if isinstance(block.mlp, MoE):
+                    aux_losses.append(block.mlp.get_auxiliary_loss())
+
+        # Compute the average auxiliary loss
+        if aux_losses:
+            aux_loss = torch.stack(aux_losses).mean()
+        else:
+            aux_loss = torch.tensor(0.0, device=logits.device)
+
+        # Combine losses
+        total_loss = primary_loss + aux_loss
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=total_loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
+        )
+
 
 
 

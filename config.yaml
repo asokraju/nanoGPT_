@@ -1,0 +1,83 @@
+model:
+  config: gpt2
+  vocab_size: 50257                      # Vocabulary size (for GPT-2 tokenizer)
+  n_layer: 4                             # Number of layers
+  n_head: 4                              # Number of attention heads
+  n_embd: 256                            # Dimension of embeddings
+  block_size: 128                        # Block size for the model
+  dropout: 0.0
+  bias: False
+  use_moe: True                          # Use Mixture of Experts
+  num_experts: 5                         # Number of experts
+  num_experts_per_tok: 2                 # Number of experts per token
+  moe_loss: True                         # Use load balancing loss for MoE
+  moe_loss_type: "entropy_regularization" # Type of loss used in MoE
+  moe_loss_coef: 1.0                     # Coefficient for the loss term
+
+tokenizer:
+  name: "gpt2"                           # GPT-2 tokenizer name from Hugging Face
+  pad_token: "<|endoftext|>"             # Set pad token as the end of text token
+
+dataset:
+  train:
+    filename: "data/shakespeare/train.bin"  # Path to the binary file
+    block_size: ${model.block_size}         # Length of the sequence (in tokens)
+    device: "cpu"                          # Device to load the tensors on ("cpu" or "cuda")
+    iterate: "random"                      # Iteration mode ('random' or 'linear')
+    return_labels: True                    # Whether to return labels (True for language model training)
+    eval_data: False                       # Whether it's evaluation data
+    eval_samples: 1000                     # Number of samples in evaluation mode
+    dtype: "np.uint16"                     # Data type of the memmapped array
+  eval:
+    filename: "data/shakespeare/val.bin"   # Path to the binary file
+    block_size: ${model.block_size}        # Length of the sequence (in tokens)
+    device: "cpu"                          # Device to load the tensors on ("cpu" or "cuda")
+    iterate: "random"                      # Iteration mode ('random' or 'linear')
+    return_labels: True                    # Whether to return labels (True for language model training)
+    eval_data: True                        # Whether it's evaluation data
+    eval_samples: 1000                     # Number of samples in evaluation mode
+    dtype: "np.uint16"                     # Data type of the memmapped array
+
+train:
+  project_name: pretraining_moe
+  work_dir: "./results"
+  experiment_name: 'moe'
+  model_save_dir: ${train.work_dir}/${train.project_name}/best_model
+  resume: True
+  input_directory: ${train.work_dir}/${train.project_name}/checkpoints
+  training_args:
+    output_dir: ${train.work_dir}/${train.project_name}/checkpoints
+    overwrite_output_dir: True
+    evaluation_strategy: steps           # Corrected 'eval_strategy'
+    eval_steps: 100
+    per_device_train_batch_size: 30
+    per_device_eval_batch_size: 30
+    gradient_accumulation_steps: 10
+    learning_rate: 5e-4                  # Learning rate for optimizer
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1e-8
+    max_grad_norm: 1.0
+    max_steps: 600_000
+    lr_scheduler_type: cosine
+    warmup_steps: 2000
+    log_level: info
+    logging_dir: ${train.work_dir}/${train.project_name}/logs
+    logging_strategy: steps              # Corrected 'logging_strategy'
+    logging_steps: 1000
+    save_strategy: steps                 # Corrected 'save_strategy'
+    save_steps: 100
+    save_total_limit: 2
+    seed: 42
+    fp16: True
+    run_name: ${train.experiment_name}
+    disable_tqdm: False
+    load_best_model_at_end: True
+    ddp_find_unused_parameters: True
+    report_to: tensorboard
+    resume_from_checkpoint: ${train.input_directory}/checkpoint-500
+    ignore_data_skip: True
+    weight_decay: 0.01                   # Weight decay to avoid overfitting
+    logging_steps: 10                    # Number of steps to log
+    log_interval: 10                     # Interval for logging Mixture of Experts (MoE) stats
+    report_to: ["tensorboard"]           # Log to tensorboard
