@@ -6,6 +6,8 @@ import logging
 from torch.utils.tensorboard import SummaryWriter
 from model_hf import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback
 import numpy as np
+from omegaconf import OmegaConf
+
 
 # Define a small synthetic dataset for debugging
 class SyntheticDataset(Dataset):
@@ -90,44 +92,19 @@ tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})  # Set pad token to eos token
 
+# Load config using OmegaConf
+config_file = 'config.yaml'  # Path to your config file
+cfg = OmegaConf.load(config_file)
 
-block_size = 128
 
 # Prepare the model configuration
-config = GPTConfig(
-    block_size=block_size,  # Small block size for debugging
-    vocab_size=tokenizer.vocab_size,  # Small vocab size for debugging
-    n_layer=4,      # Few layers for faster training
-    n_head=4,
-    n_embd=256,
-    use_moe=True,  # Enable Mixture of Experts
-    num_experts=5,
-    num_experts_per_tok=2,
-    moe_loss=True,
-    moe_loss_type = "entropy_regularization",  # Type of load balancing loss "variance_penalty", "entropy_regularization", "diversity_regularization"
-    moe_loss_coef = 1e0, 
-)
+model_config = GPTConfig(**cfg.model)
+model = GPTLMHeadModel(model_config)
+train_dataset = NumpyMemmapDataset(**cfg.dataset.train)
+eval_dataset = NumpyMemmapDataset(**cfg.dataset.eval)
+training_args = TrainingArguments(**cfg.train.training_args)
 
-# Initialize the model
-model = GPTLMHeadModel(config)
 
-# Prepare the synthetic dataset
-# dataset = SyntheticDataset(vocab_size=config.vocab_size, block_size=config.block_size)
-train_dataset = NumpyMemmapDataset(filename=r'data/shakespeare/train.bin', block_size=block_size, device='cpu', iterate='random', return_labels=True)
-eval_dataset = NumpyMemmapDataset(filename=r'data/shakespeare/val.bin', block_size=block_size, device='cpu', iterate='random', return_labels=True, eval_data=True, eval_samples=1000)
-# Define training arguments
-training_args = TrainingArguments(
-    output_dir="./results",
-    num_train_epochs=100,
-    per_device_train_batch_size=300,
-    learning_rate=5e-4,
-    weight_decay=0.01,
-    logging_dir="./logs",
-    logging_steps=10,
-    report_to=["tensorboard"],
-)
-
-# Initialize the Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -135,11 +112,15 @@ trainer = Trainer(
     eval_dataset=eval_dataset,
     tokenizer=tokenizer,
     data_collator=default_data_collator
-    # callbacks=[moe_logging_callback],
 )
-moe_logging_callback = MoEUsageLoggingCallback(trainer=trainer, logger=logger, log_interval=10, log_dir='./logs/moe_logs')
-trainer.add_callback(moe_logging_callback)
 
+# Optional MoE logging callback
+moe_logging_callback = MoEUsageLoggingCallback(
+    trainer=trainer, logger=logger,**cfg.train.moe_log
+)
+trainer.add_callback(moe_logging_callback)
 # Train the model
 trainer.train()
-trainer.model.save_pretrained(r'./results')
+
+# Save the trained model
+trainer.model.save_pretrained(cfg.train.model_save_dir)

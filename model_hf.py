@@ -273,8 +273,11 @@ class MoE(nn.Module):
         # Repeat inputs for each expert assignment
         x_repeated: torch.Tensor = x_flat.unsqueeze(1).repeat(1, self.num_experts_per_tok, 1).view(-1, C)  # (B*T*num_experts_per_tok, C)
 
+        # Ensure x_repeated is in the same dtype as y
+        x_repeated = x_repeated.to(x.dtype)
+
         # Initialize the output tensor y
-        y: torch.Tensor = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
+        y = torch.zeros_like(x_repeated, dtype=x.dtype, device=x_repeated.device)
 
         # Apply each expert to its assigned inputs
         for i, expert in enumerate(self.experts):
@@ -282,7 +285,8 @@ class MoE(nn.Module):
             mask: torch.Tensor = flat_expert_indices == i  # (B*T*num_experts_per_tok,)
             if mask.any():
                 # Apply the expert to the inputs where the mask is True
-                y[mask] = expert(x_repeated[mask])
+                expert_output = expert(x_repeated[mask])
+                y[mask] = expert_output.to(y.dtype)  # Ensure dtype matches
 
         # Reshape y to (B*T, num_experts_per_tok, C)
         y = y.view(-1, self.num_experts_per_tok, C)
@@ -293,13 +297,13 @@ class MoE(nn.Module):
         # Reshape y back to (B, T, C)
         y = y.view(B, T, C)
 
-        # Initialize auxiliary loss
-        self.auxiliary_loss = torch.tensor(0.0, device=x.device)
+        # Initialize auxiliary loss with the correct dtype
+        self.auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         if self.moe_loss:
             # Compute assigned probabilities after top-k selection
             # Initialize assigned_probs tensor of shape (B*T, num_experts)
-            assigned_probs: torch.Tensor = torch.zeros(B * T, self.num_experts, device=x.device)
+            assigned_probs: torch.Tensor = torch.zeros(B * T, self.num_experts, device=x.device, dtype=x.dtype)
 
             # Flatten top-k weights to shape (B*T, num_experts_per_tok)
             flat_topk_weights: torch.Tensor = topk_weights.squeeze(-1)  # (B*T, num_experts_per_tok)
@@ -327,7 +331,6 @@ class MoE(nn.Module):
                 # To maximize entropy, minimize negative entropy
                 self.auxiliary_loss = self.moe_loss_coef * (1 - normalized_entropy)
 
-
             elif self.moe_loss_type == "diversity_regularization":
                 # Compute KL divergence between expert usage and uniform distribution
                 uniform: torch.Tensor = torch.ones_like(expert_usage) / self.num_experts
@@ -335,6 +338,7 @@ class MoE(nn.Module):
                 self.auxiliary_loss = self.moe_loss_coef * divergence
 
         return y
+
 
     def get_auxiliary_loss(self) -> torch.Tensor:
         """
