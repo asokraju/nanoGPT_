@@ -117,12 +117,12 @@ class CausalSelfAttention(nn.Module):
         self.flash = hasattr(F, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: Using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # Create a causal mask to ensure that each position can only attend to previous positions
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size))
-                .view(1, 1, config.block_size, config.block_size)
-            )
+            # # Create a causal mask to ensure that each position can only attend to previous positions
+            # self.register_buffer(
+            #     "bias",
+            #     torch.tril(torch.ones(config.block_size, config.block_size))
+            #     .view(1, 1, config.block_size, config.block_size)
+            # )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()  # Batch size, sequence length, embedding dimension
@@ -145,9 +145,10 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True
             )
         else:
-            # Manual implementation of attention
+            # Manual implementation of attention with dynamic causal mask
             att = (q @ k.transpose(-2, -1)) * self.scale  # (B, n_head, T, T)
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            causal_mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+            att = att.masked_fill(causal_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, n_head, T, head_dim)
@@ -230,7 +231,6 @@ class MoE(nn.Module):
 
         # Initialize auxiliary loss (to be computed in forward)
         self.auxiliary_loss: torch.Tensor = torch.tensor(0.0)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MoE layer.
@@ -298,7 +298,8 @@ class MoE(nn.Module):
         y = y.view(B, T, C)
 
         # Initialize auxiliary loss with the correct dtype
-        self.auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        # self.auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        self.auxiliary_loss.zero_()
 
         if self.moe_loss:
             # Compute assigned probabilities after top-k selection
@@ -319,7 +320,7 @@ class MoE(nn.Module):
                 # Compute variance of expert usage
                 mean_usage: torch.Tensor = expert_usage.mean()
                 variance: torch.Tensor = torch.mean((expert_usage - mean_usage) ** 2)
-                self.auxiliary_loss = self.moe_loss_coef * variance
+                self.auxiliary_loss += self.moe_loss_coef * variance
 
             elif self.moe_loss_type == "entropy_regularization":
                 # Compute entropy of expert usage
@@ -329,13 +330,13 @@ class MoE(nn.Module):
                 # Normalize entropy to range between 0 and 1
                 normalized_entropy = entropy / max_entropy
                 # To maximize entropy, minimize negative entropy
-                self.auxiliary_loss = self.moe_loss_coef * (1 - normalized_entropy)
+                self.auxiliary_loss += self.moe_loss_coef * (1 - normalized_entropy)
 
             elif self.moe_loss_type == "diversity_regularization":
                 # Compute KL divergence between expert usage and uniform distribution
                 uniform: torch.Tensor = torch.ones_like(expert_usage) / self.num_experts
                 divergence: torch.Tensor = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
-                self.auxiliary_loss = self.moe_loss_coef * divergence
+                self.auxiliary_loss += self.moe_loss_coef * divergence
 
         return y
 
@@ -425,7 +426,8 @@ class GPT(PreTrainedModel):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # Language modeling head
 
         # Weight tying between token embeddings and the language modeling head
-        self.transformer.wte.weight = self.lm_head.weight  # Tied weights
+        # self.transformer.wte.weight = self.lm_head.weight  # Tied weights
+        self.lm_head.weight = self.transformer.wte.weight 
 
         # Initialize all weights
         self.apply(self._init_weights)

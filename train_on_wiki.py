@@ -86,7 +86,8 @@ logger = logging.getLogger('MoELogger')
 
 
 # Load the GPT-2 tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+# tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2", clean_up_tokenization_spaces=True)
 
 # Add special tokens, such as PAD token (if not already present)
 if tokenizer.pad_token is None:

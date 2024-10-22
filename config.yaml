@@ -41,14 +41,14 @@ dataset:
 train:
   project_name: pretraining_moe
   work_dir: "./results"
-  experiment_name: 'moe'
+  experiment_name: moe
   model_save_dir: ${train.work_dir}/${train.project_name}/best_model
   resume: True
   input_directory: ${train.work_dir}/${train.project_name}/checkpoints
   training_args:
     output_dir: ${train.work_dir}/${train.project_name}/checkpoints
     overwrite_output_dir: True
-    evaluation_strategy: steps           # Corrected 'eval_strategy'
+    eval_strategy: steps           # Corrected 'eval_strategy'
     eval_steps: 100
     per_device_train_batch_size: 30
     per_device_eval_batch_size: 30
