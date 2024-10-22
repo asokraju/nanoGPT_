@@ -9,7 +9,6 @@ configuration and output handling. Additionally, it includes mechanisms to log a
 the usage of experts within MoE layers, facilitating balanced utilization and model diagnostics.
 
 ### References
-https://github.com/Antlera/nanoGPT-moe
 Full definition of a GPT Language Model, all of it in this single file.
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
@@ -34,12 +33,19 @@ from transformers.modeling_outputs import (
 
 from transformers import TrainerCallback, TrainerState, TrainerControl, Trainer, TrainingArguments
 import logging
-
+from dataclasses import dataclass
+# Import FlashAttention if available
+try:
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
+    flash_attn_available = True
+except ImportError:
+    flash_attn_available = False
+    print("FlashAttention not available, using default attention.")
 
 class GPTConfig(PretrainedConfig):
     """
-    GPTConfig is a configuration class to store out configuration for our GPT model.
-    It does so by extending the base class 'PretrainedConfig' from Hugging Face.
+    GPTConfig is a configuration class to store our configuration for the GPT model.
+    It extends the base class 'PretrainedConfig' from Hugging Face.
     """
     model_type = "custom_gpt"
 
@@ -47,7 +53,7 @@ class GPTConfig(PretrainedConfig):
         self,
         block_size: int = 1024,
         vocab_size: int = 50304,
-        n_layer: int = 12,  # Corrected from n_layers to n_layer
+        n_layer: int = 12,
         n_head: int = 12,
         n_embd: int = 768,
         dropout: float = 0.0,
@@ -55,15 +61,16 @@ class GPTConfig(PretrainedConfig):
         use_moe: bool = False,
         num_experts: int = 8,
         num_experts_per_tok: int = 2,
-        moe_loss: bool = True,  # Option to enable/disable MoE loss
-        moe_loss_type: str = "entropy_regularization",  # Type of load balancing loss "variance_penalty", "entropy_regularization", "diversity_regularization"
-        moe_loss_coef: float = 1e-2,  # Coefficient for the auxiliary loss
+        moe_loss: bool = True,
+        moe_loss_type: str = "entropy_regularization",
+        moe_loss_coef: float = 1e-2, # aux loss is scaled at each expert
+        aux_loss_weight: float = 1.0, # average aux loss is again multiplied by aux_loss_weight before added to the total loss. Overall loss coeff will be moe_loss_coef*aux_loss_weight
         **kwargs
     ):
         super().__init__(**kwargs)
         self.block_size = block_size
         self.vocab_size = vocab_size
-        self.n_layer = n_layer  # Ensuring consistency in naming
+        self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
         self.dropout = dropout
@@ -72,10 +79,10 @@ class GPTConfig(PretrainedConfig):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_loss = moe_loss
-        self.moe_loss_type = moe_loss_type  # Options: 'variance_penalty', 'entropy_regularization', 'diversity_regularization'
+        self.moe_loss_type = moe_loss_type
         self.moe_loss_coef = moe_loss_coef
-
-
+        self.aux_loss_weight = aux_loss_weight
+        print(f"WARNING: Overall aux loss coef is {moe_loss_coef*aux_loss_weight}.")
 
 class LayerNorm(nn.Module):
     """
@@ -90,11 +97,10 @@ class LayerNorm(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, eps=1e-5)
 
-
 class CausalSelfAttention(nn.Module):
     """
     Implements causal (masked) self-attention mechanism.
-    Supports both standard and Flash Attention (if available).
+    Supports both standard and FlashAttention (if available).
     """
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -102,7 +108,6 @@ class CausalSelfAttention(nn.Module):
 
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
-        self.scale = 1 / math.sqrt(self.head_dim)
 
         # Combined projection for query, key, and value
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -113,53 +118,59 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # Determine if Flash Attention is available
-        self.flash = hasattr(F, 'scaled_dot_product_attention')
+        # Check if FlashAttention is available
+        self.flash = flash_attn_available
         if not self.flash:
-            print("WARNING: Using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # # Create a causal mask to ensure that each position can only attend to previous positions
-            # self.register_buffer(
-            #     "bias",
-            #     torch.tril(torch.ones(config.block_size, config.block_size))
-            #     .view(1, 1, config.block_size, config.block_size)
-            # )
+            print("WARNING: FlashAttention is not available. Using default attention mechanism.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()  # Batch size, sequence length, embedding dimension
 
         # Project inputs to query, key, and value
         qkv = self.c_attn(x)  # Shape: (B, T, 3*C)
-        q, k, v = qkv.split(C, dim=2)  # Each shape: (B, T, C)
 
-        # Reshape for multi-head attention
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, T, head_dim)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, T, head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, T, head_dim)
+        # Reshape qkv to (B, T, 3, n_head, head_dim)
+        qkv = qkv.view(B, T, 3, self.n_head, self.head_dim)
 
-        if self.flash:
-            # Efficient attention using Flash Attention CUDA kernels
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
+        if self.flash and x.is_cuda and x.dtype in [torch.float16, torch.bfloat16]:
+            # Ensure qkv is contiguous
+            qkv = qkv.contiguous()
+
+            # Use FlashAttention
+            y = flash_attn_qkvpacked_func(
+                qkv,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True
-            )
+                causal=True
+            )  # Output shape: (B, T, n_head, head_dim)
+
+            # Reshape y to (B, T, C)
+            y = y.view(B, T, C)
         else:
-            # Manual implementation of attention with dynamic causal mask
-            att = (q @ k.transpose(-2, -1)) * self.scale  # (B, n_head, T, T)
+            # Fallback to default attention mechanism
+            # Split qkv into q, k, v
+            qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, n_head, T, head_dim)
+            q, k, v = qkv[0], qkv[1], qkv[2]  # Each shape: (B, n_head, T, head_dim)
+
+            # Compute scaled dot-product attention
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_head, T, T)
+
+            # Apply causal mask
             causal_mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
             att = att.masked_fill(causal_mask == 0, float('-inf'))
+
+            # Compute attention probabilities
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
+
+            # Compute attention output
             y = att @ v  # (B, n_head, T, head_dim)
 
-        # Concatenate heads
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+            # Transpose and reshape y to (B, T, C)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
 
         # Apply output projection and dropout
         y = self.resid_dropout(self.c_proj(y))  # (B, T, C)
         return y
-
 
 class MLP(nn.Module):
     """
@@ -181,7 +192,6 @@ class MLP(nn.Module):
         x = self.dropout(x)        # (B, T, C)
         return x
 
-
 class MoE(nn.Module):
     """
     Mixture of Experts (MoE) layer implementation for transformer models.
@@ -199,7 +209,6 @@ class MoE(nn.Module):
         moe_loss_coef (float): Coefficient for scaling the auxiliary loss.
         expert_usage_counts (torch.Tensor): Counts of expert usage for monitoring.
         total_assignments (int): Total number of expert assignments.
-        auxiliary_loss (torch.Tensor): The auxiliary loss computed during the forward pass.
     """
 
     def __init__(self, config: GPTConfig) -> None:
@@ -229,9 +238,11 @@ class MoE(nn.Module):
         self.register_buffer("expert_usage_counts", torch.zeros(self.num_experts, dtype=torch.long))
         self.total_assignments: int = 0  # Total number of expert assignments
 
-        # Initialize auxiliary loss (to be computed in forward)
-        self.auxiliary_loss: torch.Tensor = torch.tensor(0.0)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accumulators for auxiliary loss
+        self.register_buffer("auxiliary_loss_sum", torch.tensor(0.0))
+        self.num_auxiliary_loss_updates = 0
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the MoE layer.
 
@@ -239,7 +250,7 @@ class MoE(nn.Module):
             x (torch.Tensor): Input tensor of shape (B, T, C).
 
         Returns:
-            torch.Tensor: Output tensor of shape (B, T, C).
+            Tuple[torch.Tensor, torch.Tensor]: Output tensor and auxiliary loss.
         """
         # Get batch size (B), sequence length (T), and embedding dimension (C)
         B, T, C = x.size()
@@ -254,8 +265,6 @@ class MoE(nn.Module):
         gating_probs: torch.Tensor = F.softmax(scores, dim=-1)  # (B*T, num_experts)
 
         # Select top-k experts per token based on gating scores
-        topk_scores: torch.Tensor
-        topk_indices: torch.Tensor
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, num_experts_per_tok)
 
         # Apply softmax to the top-k scores to get normalized weights
@@ -298,15 +307,14 @@ class MoE(nn.Module):
         y = y.view(B, T, C)
 
         # Initialize auxiliary loss with the correct dtype
-        self.auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        # self.auxiliary_loss.zero_()
+        auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         if self.moe_loss:
             # Compute assigned probabilities after top-k selection
             # Initialize assigned_probs tensor of shape (B*T, num_experts)
             assigned_probs: torch.Tensor = torch.zeros(B * T, self.num_experts, device=x.device, dtype=x.dtype)
 
-            # Flatten top-k weights to shape (B*T, num_experts_per_tok)
+            # Flatten topk_weights to shape (B*T, num_experts_per_tok)
             flat_topk_weights: torch.Tensor = topk_weights.squeeze(-1)  # (B*T, num_experts_per_tok)
 
             # Scatter the top-k weights into the assigned_probs tensor
@@ -320,7 +328,7 @@ class MoE(nn.Module):
                 # Compute variance of expert usage
                 mean_usage: torch.Tensor = expert_usage.mean()
                 variance: torch.Tensor = torch.mean((expert_usage - mean_usage) ** 2)
-                self.auxiliary_loss = self.moe_loss_coef * variance
+                auxiliary_loss += self.moe_loss_coef * variance
 
             elif self.moe_loss_type == "entropy_regularization":
                 # Compute entropy of expert usage
@@ -330,25 +338,40 @@ class MoE(nn.Module):
                 # Normalize entropy to range between 0 and 1
                 normalized_entropy = entropy / max_entropy
                 # To maximize entropy, minimize negative entropy
-                self.auxiliary_loss = self.moe_loss_coef * (1 - normalized_entropy)
+                auxiliary_loss += self.moe_loss_coef * (1 - normalized_entropy)
 
             elif self.moe_loss_type == "diversity_regularization":
                 # Compute KL divergence between expert usage and uniform distribution
                 uniform: torch.Tensor = torch.ones_like(expert_usage) / self.num_experts
                 divergence: torch.Tensor = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
-                self.auxiliary_loss = self.moe_loss_coef * divergence
+                auxiliary_loss += self.moe_loss_coef * divergence
 
-        return y
+        # Detach auxiliary_loss before accumulation to avoid retaining the computational graph
+        detached_aux_loss = auxiliary_loss.detach()
+        self.auxiliary_loss_sum += detached_aux_loss
+        self.num_auxiliary_loss_updates += 1
 
+        return y, auxiliary_loss
 
-    def get_auxiliary_loss(self) -> torch.Tensor:
+    def get_auxiliary_loss(self) -> float:
         """
-        Returns the auxiliary loss computed during the forward pass.
+        Returns the average auxiliary loss accumulated over forward passes.
 
         Returns:
-            torch.Tensor: The auxiliary loss tensor.
+            float: The average auxiliary loss.
         """
-        return self.auxiliary_loss
+        if self.num_auxiliary_loss_updates > 0:
+            avg_aux_loss = (self.auxiliary_loss_sum / self.num_auxiliary_loss_updates).item()
+        else:
+            avg_aux_loss = 0.0
+        return avg_aux_loss
+
+    def reset_auxiliary_loss(self) -> None:
+        """
+        Resets the accumulated auxiliary loss and the count.
+        """
+        self.auxiliary_loss_sum.zero_()
+        self.num_auxiliary_loss_updates = 0
 
     def get_usage_counts(self) -> torch.Tensor:
         """
@@ -384,7 +407,7 @@ class Block(nn.Module):
             print("Using regular MLP")
             self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Transformer block.
         
@@ -392,16 +415,31 @@ class Block(nn.Module):
             x (torch.Tensor): Input tensor of shape (B, T, C)
         
         Returns:
-            torch.Tensor: Output tensor of shape (B, T, C)
+            Tuple[torch.Tensor, torch.Tensor]: Output tensor and auxiliary loss.
         """
         # Apply LayerNorm and Self-Attention with residual connection
         x = x + self.attn(self.ln_1(x))
         
         # Apply LayerNorm and MLP (or MoE) with residual connection
-        x = x + self.mlp(self.ln_2(x))
+        if isinstance(self.mlp, MoE):
+            mlp_output, auxiliary_loss = self.mlp(self.ln_2(x))
+        else:
+            mlp_output = self.mlp(self.ln_2(x))
+            auxiliary_loss = torch.tensor(0.0, device=x.device)
         
-        return x
+        x = x + mlp_output
+        
+        return x, auxiliary_loss
 
+from dataclasses import dataclass
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+
+@dataclass
+class BaseModelOutputWithAuxiliaryLoss(BaseModelOutputWithPastAndCrossAttentions):
+    """
+    Extends BaseModelOutputWithPastAndCrossAttentions to include auxiliary loss.
+    """
+    auxiliary_loss: Optional[torch.FloatTensor] = None
 
 class GPT(PreTrainedModel):
     """
@@ -426,7 +464,6 @@ class GPT(PreTrainedModel):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # Language modeling head
 
         # Weight tying between token embeddings and the language modeling head
-        # self.transformer.wte.weight = self.lm_head.weight  # Tied weights
         self.lm_head.weight = self.transformer.wte.weight 
 
         # Initialize all weights
@@ -488,7 +525,7 @@ class GPT(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-    ) -> BaseModelOutputWithPastAndCrossAttentions:
+    ) -> BaseModelOutputWithAuxiliaryLoss:
         """
         Forward pass for the GPT model.
         
@@ -507,7 +544,7 @@ class GPT(PreTrainedModel):
             output_hidden_states (Optional[bool]): Whether to output hidden states
         
         Returns:
-            BaseModelOutputWithPastAndCrossAttentions: Model outputs
+            BaseModelOutputWithAuxiliaryLoss: Model outputs including auxiliary loss
         """
         device = input_ids.device
         B, T = input_ids.size()
@@ -518,34 +555,41 @@ class GPT(PreTrainedModel):
 
         # Compute token and position embeddings
         pos_emb = self.transformer.wpe(pos)        # (1, T, C)
-        # x = self.transformer.drop(tok_emb + pos_emb)  # (B, T, C)
         if inputs_embeds is not None:
             x = self.transformer.drop(inputs_embeds + pos_emb)  # (B, T, C)
         else:
             tok_emb = self.transformer.wte(input_ids)  # (B, T, C)
             x = self.transformer.drop(tok_emb + pos_emb)  # (B, T, C)
 
-
         all_hidden_states = () if output_hidden_states else None
 
+        auxiliary_losses = []
         # Pass through each Transformer block
         for block in self.transformer.h:
             if output_hidden_states:
                 all_hidden_states += (x,)
-            x = block(x)
+            x, auxiliary_loss = block(x)
+            auxiliary_losses.append(auxiliary_loss)
 
         # Final LayerNorm
         x = self.transformer.ln_f(x)
         if output_hidden_states:
             all_hidden_states += (x,)
 
+        # Compute average auxiliary loss
+        if len(auxiliary_losses) > 0:
+            average_auxiliary_loss = torch.stack(auxiliary_losses).mean()
+        else:
+            average_auxiliary_loss = torch.tensor(0.0, device=x.device)
+
         # Prepare output
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return BaseModelOutputWithAuxiliaryLoss(
             last_hidden_state=x,
             past_key_values=None,  # To be implemented if caching is desired
             hidden_states=all_hidden_states,
             attentions=None,        # To be implemented if attention outputs are desired
             cross_attentions=None,  # To be implemented if cross attentions are desired
+            auxiliary_loss=average_auxiliary_loss
         )
 
     def crop_block_size(self, block_size: int):
@@ -589,7 +633,10 @@ class GPT(PreTrainedModel):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
-        optim_groups = [            {"params": decay_params, "weight_decay": weight_decay},            {"params": nodecay_params, "weight_decay": 0.0},        ]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -671,6 +718,11 @@ class GPT(PreTrainedModel):
 
         return model_inputs
 
+@dataclass
+class CausalLMOutputWithAuxiliaryLoss(CausalLMOutputWithCrossAttentions):
+    primary_loss: Optional[torch.FloatTensor] = None
+    auxiliary_loss: Optional[torch.FloatTensor] = None
+
 
 class GPTLMHeadModel(GPT):
     """
@@ -750,7 +802,7 @@ class GPTLMHeadModel(GPT):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-    ) -> CausalLMOutputWithCrossAttentions:
+    ) -> CausalLMOutputWithAuxiliaryLoss:
         """
         Forward pass for the GPTLMHeadModel.
         Computes the logits and optionally the loss if labels are provided.
@@ -777,11 +829,13 @@ class GPTLMHeadModel(GPT):
 
         # If we are generating text (no labels provided), just return logits
         if labels is None:
-            return CausalLMOutputWithCrossAttentions(
+            return CausalLMOutputWithAuxiliaryLoss(
                 logits=logits,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
                 cross_attentions=outputs.cross_attentions,
+                primary_loss=None,
+                auxiliary_loss=None,
             )
 
         # Shift logits and labels for next-token prediction when labels are provided
@@ -795,40 +849,48 @@ class GPTLMHeadModel(GPT):
             ignore_index=-1
         )
 
-        # Initialize list to collect auxiliary losses
-        aux_losses = []
+        # Retrieve average auxiliary loss
+        average_auxiliary_loss = outputs.auxiliary_loss
 
-        if self.config.use_moe:
-            # Collect auxiliary losses from all MoE layers
-            for block in self.transformer.h:
-                if isinstance(block.mlp, MoE):
-                    aux_losses.append(block.mlp.get_auxiliary_loss())
-
-        # Compute the average auxiliary loss
-        if aux_losses:
-            aux_loss = torch.stack(aux_losses).mean()
-        else:
-            aux_loss = torch.tensor(0.0, device=logits.device)
+        # Adjust the weighting of auxiliary loss if necessary
+        aux_loss_weight = self.config.aux_loss_weight  # We'll add this to GPTConfig
 
         # Combine losses
-        total_loss = primary_loss + aux_loss
+        total_loss = primary_loss + aux_loss_weight * average_auxiliary_loss
 
-        return CausalLMOutputWithCrossAttentions(
+        return CausalLMOutputWithAuxiliaryLoss(
             loss=total_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
+            primary_loss=primary_loss,
+            auxiliary_loss=average_auxiliary_loss,
         )
 
+class MoETrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        loss = outputs.loss
+        primary_loss = outputs.primary_loss
+        auxiliary_loss = outputs.auxiliary_loss
 
+        # Log the separate losses
+        self.log({
+            "loss": loss.item(),
+            "primary_loss": primary_loss.item(),
+            "auxiliary_loss": auxiliary_loss.item()
+        })
 
-
-
-
-
-# Adjusted MoEUsageLoggingCallback to ensure correct parameter signatures
+        if return_outputs:
+            return loss, outputs
+        else:
+            return loss
+        
 class MoEUsageLoggingCallback(TrainerCallback):
+    """
+    Callback to log MoE expert usage statistics and auxiliary loss during training.
+    """
     def __init__(self, trainer: Trainer, logger: Optional[logging.Logger] = None, log_interval: int = 100, log_dir: str = './logs_tensorboard'):
         super().__init__()
         self.log_interval = log_interval
@@ -838,10 +900,9 @@ class MoEUsageLoggingCallback(TrainerCallback):
         self.writer = SummaryWriter(log_dir)
 
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        # print(f"Callback invoked on step end. Step: {state.global_step}")  # Debug print
         self.steps_since_last_log += 1
         if self.steps_since_last_log >= self.log_interval:
-            print("Logging MoE usage stats...")  # Debug print
+            print("Logging MoE usage stats...")
             model = self.trainer.model  # Access the model directly from the trainer instance
             moe_layers = self._get_moe_layers(model)
             for idx, moe in enumerate(moe_layers):
@@ -857,10 +918,12 @@ class MoEUsageLoggingCallback(TrainerCallback):
                 # Log to TensorBoard
                 for i in range(moe.num_experts):
                     self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Expert_{i}_Usage", usage_percentages[i], state.global_step)
-                # Log auxiliary loss
-                aux_loss = moe.get_auxiliary_loss().item()
-                self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Auxiliary_Loss", aux_loss, state.global_step)
+                # Log average auxiliary loss
+                avg_aux_loss = moe.get_auxiliary_loss()
+                self.writer.add_scalar(f"MoE_Layer_{idx + 1}/Auxiliary_Loss", avg_aux_loss, state.global_step)
+                # Reset accumulators
                 moe.reset_usage_counts()
+                moe.reset_auxiliary_loss()
 
             self.steps_since_last_log = 0
 

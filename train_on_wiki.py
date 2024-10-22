@@ -4,10 +4,10 @@ from transformers import TrainingArguments, Trainer, GPT2Tokenizer, default_data
 from typing import Optional
 import logging
 from torch.utils.tensorboard import SummaryWriter
-from model_hf import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback
+from model_hf_with_flash import GPTConfig, GPTLMHeadModel, MoEUsageLoggingCallback, MoETrainer
 import numpy as np
 from omegaconf import OmegaConf
-
+import os
 
 # Define a small synthetic dataset for debugging
 class SyntheticDataset(Dataset):
@@ -63,10 +63,13 @@ class NumpyMemmapDataset(Dataset):
         x = torch.from_numpy(self.data[idx:idx + self.block_size].astype(np.int64))
         y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.block_size].astype(np.int64))
 
-        if self.device.type == 'cuda':
-            # Pin memory for GPU asynchronous transfer
-            x = x.pin_memory().to(self.device, non_blocking=True)
-            y = y.pin_memory().to(self.device, non_blocking=True)
+        # trainer handles this internally: 
+        # This can cause issues because the Trainer expects data to be on the CPU, and it handles moving data to the GPU internally. 
+        # Additionally, moving data to the device within the dataset can interfere with data parallelism and data loaders.
+        # if self.device.type == 'cuda':
+        #     # Pin memory for GPU asynchronous transfer
+        #     x = x.pin_memory().to(self.device, non_blocking=True)
+        #     y = y.pin_memory().to(self.device, non_blocking=True)
 
         # If `return_labels` is true, return both input and target (for GPT training)
         if self.return_labels:
@@ -106,7 +109,7 @@ eval_dataset = NumpyMemmapDataset(**cfg.dataset.eval)
 training_args = TrainingArguments(**cfg.train.training_args)
 
 
-trainer = Trainer(
+trainer = MoETrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
@@ -120,8 +123,19 @@ moe_logging_callback = MoEUsageLoggingCallback(
     trainer=trainer, logger=logger,**cfg.train.moe_log
 )
 trainer.add_callback(moe_logging_callback)
+
+
+# Check for existing checkpoint
+last_checkpoint = None
+# if os.path.isdir(training_args.output_dir):
+#     last_checkpoint = Trainer.get_last_checkpoint(training_args.output_dir)
+#     if last_checkpoint is not None:
+#         logger.info(f"Resuming training from checkpoint {last_checkpoint}")
+#     else:
+#         logger.info("No checkpoint found. Starting from scratch.")
+
 # Train the model
-trainer.train()
+trainer.train(resume_from_checkpoint=last_checkpoint)
 
 # Save the trained model
 trainer.model.save_pretrained(cfg.train.model_save_dir)
