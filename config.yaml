@@ -1,9 +1,9 @@
 model:
   config: gpt2
   vocab_size: 50257                      # Vocabulary size (for GPT-2 tokenizer) 1
-  n_layer: 4                             # Number of layers 3
-  n_head: 4                              # Number of attention heads 4
-  n_embd: 256                            # Dimension of embeddings 5
+  n_layer: 6                             # Number of layers 3
+  n_head: 8                              # Number of attention heads 4
+  n_embd: 512                            # Dimension of embeddings 5
   block_size: 128                        # Block size for the model 2 
   dropout: 0.0
   bias: False
@@ -13,6 +13,7 @@ model:
   moe_loss: True                         # Use load balancing loss for MoE
   moe_loss_type: "entropy_regularization" # Type of loss used in MoE
   moe_loss_coef: 1.0                     # Coefficient for the loss term
+  aux_loss_weight: 1.0 
 
 tokenizer:
   name: "gpt2"                           # GPT-2 tokenizer name from Hugging Face
@@ -40,7 +41,7 @@ dataset:
 
 train:
   project_name: pretraining_moe
-  work_dir: "./results"
+  work_dir: ./results
   experiment_name: moe
   model_save_dir: ${train.work_dir}/${train.project_name}/best_model
   resume: True
@@ -78,6 +79,8 @@ train:
     resume_from_checkpoint: ${train.input_directory}/checkpoint-500
     ignore_data_skip: True
     weight_decay: 0.01                   # Weight decay to avoid overfitting
+    metric_for_best_model: loss
+    greater_is_better: False
     # report_to: ["tensorboard"]           # Log to tensorboard
   moe_log:
         log_interval: 10                     # Interval for logging Mixture of Experts (MoE) stats
