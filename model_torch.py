@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+import inspect
+
 
 class LayerNorm(nn.Module):
     """LayerNorm module with optional bias parameter."""
@@ -117,10 +119,6 @@ class MoE(nn.Module):
         self.register_buffer("expert_usage_counts", torch.zeros(self.num_experts, dtype=torch.long))
         self.total_assignments = 0  # Total number of expert assignments
 
-        # Accumulators for auxiliary loss
-        self.register_buffer("auxiliary_loss_sum", torch.tensor(0.0))
-        self.num_auxiliary_loss_updates = 0
-
     def forward(self, x):
         """
         Forward pass of the MoE layer.
@@ -217,40 +215,20 @@ class MoE(nn.Module):
                 divergence = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
                 auxiliary_loss += self.moe_loss_coef * divergence
 
-        # Accumulate auxiliary loss for monitoring
-        self.auxiliary_loss_sum += auxiliary_loss.detach()
-        self.num_auxiliary_loss_updates += 1
-
         return y, auxiliary_loss
 
-    def get_auxiliary_loss(self):
+    def get_usage_percentages(self):
         """
-        Returns the average auxiliary loss accumulated over forward passes.
+        Returns the usage percentages of each expert.
 
         Returns:
-            float: The average auxiliary loss.
+            List[float]: A list containing the usage percentage of each expert.
         """
-        if self.num_auxiliary_loss_updates > 0:
-            avg_aux_loss = (self.auxiliary_loss_sum / self.num_auxiliary_loss_updates).item()
+        if self.total_assignments > 0:
+            usage_percentages = (self.expert_usage_counts.float() / self.total_assignments) * 100
+            return usage_percentages.tolist()
         else:
-            avg_aux_loss = 0.0
-        return avg_aux_loss
-
-    def reset_auxiliary_loss(self):
-        """
-        Resets the accumulated auxiliary loss and the count.
-        """
-        self.auxiliary_loss_sum.zero_()
-        self.num_auxiliary_loss_updates = 0
-
-    def get_usage_counts(self):
-        """
-        Returns the counts of expert usage.
-
-        Returns:
-            torch.Tensor: A tensor containing the usage counts of each expert.
-        """
-        return self.expert_usage_counts
+            return [0.0] * self.num_experts
 
     def reset_usage_counts(self):
         """
@@ -398,7 +376,7 @@ class GPT(nn.Module):
             targets (torch.Tensor, optional): Target indices for computing loss
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Logits and loss
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Logits, total loss, main loss, auxiliary loss
         """
         device = idx.device
         b, t = idx.size()
@@ -427,16 +405,15 @@ class GPT(nn.Module):
                 targets.view(-1),
                 ignore_index=-1
             )
-            # Sum up the auxiliary losses
-            total_auxiliary_loss = torch.stack(auxiliary_losses).sum()
+            # Compute mean of the auxiliary losses
+            total_auxiliary_loss = torch.stack(auxiliary_losses).mean()
             # Combine main loss and auxiliary loss
             loss = main_loss + total_auxiliary_loss
+            return logits, loss, main_loss, total_auxiliary_loss
         else:
             # Inference mode: only compute logits for the last position
             logits = self.lm_head(x[:, [-1], :])  # (B, 1, vocab_size)
-            loss = None
-
-        return logits, loss
+            return logits, None, None, None
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
