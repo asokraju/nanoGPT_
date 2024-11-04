@@ -100,13 +100,29 @@ class MoE(nn.Module):
 
     Args:
         config (GPTConfig): Configuration object containing model parameters.
+            - num_experts (int): Total number of experts (dynamic + static).
+            - num_experts_per_tok (int): Number of dynamic experts per token.
+            - static_experts (int): Number of static experts.
+
+    If static_experts is not zero, tokens always go through static experts,
+    and some of the other experts depending on the routing.
     """
     def __init__(self, config):
         super().__init__()
-        self.num_experts = config.num_experts
+        self.total_experts = config.num_experts  # Total number of experts (dynamic + static)
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
-        self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.static_experts = config.static_experts  # Number of static experts
+        self.num_dynamic_experts = self.total_experts - self.static_experts  # Number of dynamic experts
+
+        # Initialize dynamic experts
+        self.dynamic_experts = nn.ModuleList([MLP(config) for _ in range(self.num_dynamic_experts)])
+        # Initialize static experts
+        if self.static_experts > 0:
+            print(f"Using {self.static_experts} static experts in MoE")
+            self.static_expert_modules = nn.ModuleList([MLP(config) for _ in range(self.static_experts)])
+
+        # Gating network outputs scores for dynamic experts only
+        self.gate = nn.Linear(config.n_embd, self.num_dynamic_experts, bias=False)
         self.moe_loss = config.moe_loss
         self.moe_loss_type = config.moe_loss_type
         self.moe_loss_coef = config.moe_loss_coef
@@ -115,9 +131,9 @@ class MoE(nn.Module):
         valid_loss_types = ["variance_penalty", "entropy_regularization", "diversity_regularization"]
         assert self.moe_loss_type in valid_loss_types, f"Invalid moe_loss_type. Choose from {valid_loss_types}"
 
-        # Initialize expert usage counters for monitoring purposes
-        self.register_buffer("expert_usage_counts", torch.zeros(self.num_experts, dtype=torch.long))
-        self.total_assignments = 0  # Total number of expert assignments
+        # Initialize expert usage counters for monitoring purposes (dynamic experts only)
+        self.register_buffer("expert_usage_counts", torch.zeros(self.num_dynamic_experts, dtype=torch.long))
+        self.total_assignments = 0  # Total number of expert assignments to dynamic experts
 
     def forward(self, x):
         """
@@ -131,66 +147,78 @@ class MoE(nn.Module):
         """
         B, T, C = x.size()
 
+        # Process static experts if any
+        if self.static_experts > 0:
+            # Process x through each static expert
+            y_static_list = [expert(x) for expert in self.static_expert_modules]
+            # Sum the outputs from static experts
+            y_static = torch.stack(y_static_list, dim=0).sum(dim=0)  # (B, T, C)
+        else:
+            y_static = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
         # Flatten the input to shape (B*T, C)
         x_flat = x.view(-1, C)
 
-        # Compute gating scores: shape (B*T, num_experts)
+        # Compute gating scores for dynamic experts: shape (B*T, num_dynamic_experts)
         scores = self.gate(x_flat)
 
-        # Select top-k experts per token based on gating scores
-        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        # Select top-k dynamic experts per token based on gating scores
+        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)  # (B*T, k)
 
         # Apply softmax to the top-k scores to get normalized weights
-        topk_weights = F.softmax(topk_scores, dim=-1).view(-1, self.num_experts_per_tok, 1)
+        topk_weights = F.softmax(topk_scores, dim=-1).view(-1, self.num_experts_per_tok, 1)  # (B*T, k, 1)
 
         # Flatten the expert indices for indexing
-        flat_expert_indices = topk_indices.view(-1)
+        flat_expert_indices = topk_indices.view(-1)  # (B*T*k,)
 
-        # Update expert usage counts for monitoring (not used in training)
+        # Update expert usage counts for monitoring (dynamic experts only)
         with torch.no_grad():
-            counts = flat_expert_indices.bincount(minlength=self.num_experts)
+            counts = flat_expert_indices.bincount(minlength=self.num_dynamic_experts)
             self.expert_usage_counts += counts
             self.total_assignments += flat_expert_indices.size(0)
 
         # Repeat inputs for each expert assignment
-        x_repeated = x_flat.unsqueeze(1).repeat(1, self.num_experts_per_tok, 1).view(-1, C)
+        x_repeated = x_flat.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, C)  # (B*T*k, C)
 
-        # Initialize the output tensor y
-        y = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
+        # Initialize the output tensor y_dynamic
+        y_dynamic = torch.zeros_like(x_repeated, dtype=x.dtype, device=x.device)
 
-        # Apply each expert to its assigned inputs
-        for i, expert in enumerate(self.experts):
+        # Apply each dynamic expert to its assigned inputs
+        for i, expert in enumerate(self.dynamic_experts):
             # Create a mask for the current expert
-            mask = flat_expert_indices == i  # (B*T*num_experts_per_tok,)
+            mask = flat_expert_indices == i  # (B*T*k,)
             if mask.any():
                 # Apply the expert to the inputs where the mask is True
                 expert_output = expert(x_repeated[mask])
-                y[mask] = expert_output.to(y.dtype)  # Ensure dtype matches
+                y_dynamic[mask] = expert_output.to(y_dynamic.dtype)  # Ensure dtype matches
 
-        # Reshape y to (B*T, num_experts_per_tok, C)
-        y = y.view(-1, self.num_experts_per_tok, C)
+        # Reshape y_dynamic to (B*T, num_experts_per_tok, C)
+        y_dynamic = y_dynamic.view(-1, self.num_experts_per_tok, C)
 
         # Apply the top-k weights to the expert outputs and sum over experts
-        y = (y * topk_weights).sum(dim=1)  # (B*T, C)
+        y_dynamic = (y_dynamic * topk_weights).sum(dim=1)  # (B*T, C)
 
-        # Reshape y back to (B, T, C)
-        y = y.view(B, T, C)
+        # Reshape y_dynamic back to (B, T, C)
+        y_dynamic = y_dynamic.view(B, T, C)
+
+        # Combine outputs from static and dynamic experts
+        y = y_dynamic + y_static  # (B, T, C)
 
         # Initialize auxiliary loss
         auxiliary_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         if self.moe_loss:
             # Compute assigned probabilities after top-k selection
-            assigned_probs = torch.zeros(B * T, self.num_experts, device=x.device, dtype=x.dtype)
+            assigned_probs = torch.zeros(B * T, self.num_dynamic_experts, device=x.device, dtype=x.dtype)
 
             # Flatten topk_weights to shape (B*T, num_experts_per_tok)
-            flat_topk_weights = topk_weights.squeeze(-1)
+            flat_topk_weights = topk_weights.squeeze(-1)  # (B*T, k)
 
             # Scatter the top-k weights into the assigned_probs tensor
-            assigned_probs.scatter_(dim=1, index=topk_indices, src=flat_topk_weights)
+            assigned_probs.scatter_(dim=1, index=topk_indices, src=flat_topk_weights)  # (B*T, num_dynamic_experts)
 
             # Compute expert usage as the mean over all tokens
-            expert_usage = assigned_probs.mean(dim=0)  # (num_experts,)
+            expert_usage = assigned_probs.mean(dim=0)  # (num_dynamic_experts,)
 
             # Compute auxiliary loss based on the specified moe_loss_type
             if self.moe_loss_type == "variance_penalty":
@@ -203,7 +231,7 @@ class MoE(nn.Module):
                 # Compute entropy of expert usage
                 entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-10))
                 # Compute maximum possible entropy
-                max_entropy = torch.log(torch.tensor(float(self.num_experts), dtype=x.dtype, device=x.device))
+                max_entropy = torch.log(torch.tensor(float(self.num_dynamic_experts), dtype=x.dtype, device=x.device))
                 # Normalize entropy to range between 0 and 1
                 normalized_entropy = entropy / max_entropy
                 # To maximize entropy, minimize negative entropy
@@ -211,7 +239,7 @@ class MoE(nn.Module):
 
             elif self.moe_loss_type == "diversity_regularization":
                 # Compute KL divergence between expert usage and uniform distribution
-                uniform = torch.ones_like(expert_usage) / self.num_experts
+                uniform = torch.ones_like(expert_usage) / self.num_dynamic_experts
                 divergence = F.kl_div(torch.log(expert_usage + 1e-10), uniform, reduction='batchmean')
                 auxiliary_loss += self.moe_loss_coef * divergence
 
@@ -219,16 +247,16 @@ class MoE(nn.Module):
 
     def get_usage_percentages(self):
         """
-        Returns the usage percentages of each expert.
+        Returns the usage percentages of each dynamic expert.
 
         Returns:
-            List[float]: A list containing the usage percentage of each expert.
+            List[float]: A list containing the usage percentage of each dynamic expert.
         """
         if self.total_assignments > 0:
             usage_percentages = (self.expert_usage_counts.float() / self.total_assignments) * 100
             return usage_percentages.tolist()
         else:
-            return [0.0] * self.num_experts
+            return [0.0] * self.num_dynamic_experts
 
     def reset_usage_counts(self):
         """
@@ -236,6 +264,7 @@ class MoE(nn.Module):
         """
         self.expert_usage_counts.zero_()
         self.total_assignments = 0
+
 
 class Block(nn.Module):
     """
@@ -292,8 +321,9 @@ class GPTConfig:
         dropout (float): Dropout rate.
         bias (bool): Whether to use bias in Linear and LayerNorm layers.
         use_moe (bool): Whether to use Mixture of Experts (MoE) in MLP layers.
-        num_experts (int): Number of experts in MoE.
+        num_experts (int): Number of dynamic experts in MoE.
         num_experts_per_tok (int): Number of experts per token in MoE.
+        static_experts (int): Number of static experts in MoE.
         moe_loss (bool): Whether to use auxiliary loss in MoE.
         moe_loss_type (str): Type of auxiliary loss in MoE.
         moe_loss_coef (float): Coefficient for the auxiliary loss.
@@ -307,8 +337,9 @@ class GPTConfig:
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # MoE parameters
     use_moe: bool = True  # Whether to use MoE in MLP layers
-    num_experts: int = 4  # Number of experts in MoE
+    num_experts: int = 4  # Number of dynamic experts in MoE
     num_experts_per_tok: int = 2  # Number of experts per token
+    static_experts: int = 0  # Number of static experts
     moe_loss: bool = True  # Whether to use auxiliary loss
     moe_loss_type: str = 'variance_penalty'  # Type of auxiliary loss
     moe_loss_coef: float = 0.01  # Coefficient for the auxiliary loss

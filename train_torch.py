@@ -19,7 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 
 """
-
+import re
 import os
 import time
 import math
@@ -76,6 +76,16 @@ torch.backends.cudnn.allow_tf32 = True  # Allow TF32 on cuDNN
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config.dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# -----------------------------------------------------------------------------
+# Add new parameters to the configuration
+# -----------------------------------------------------------------------------
+
+# Ensure new parameters exist
+if not hasattr(config, 'num_checkpoints'):
+    config.num_checkpoints = 5  # Default value
+if not hasattr(config, 'save_current_ckpt'):
+    config.save_current_ckpt = True  # Default value
 
 # -----------------------------------------------------------------------------
 # Data loading
@@ -137,6 +147,7 @@ model_args = dict(
     use_moe=config.use_moe,
     num_experts=config.num_experts,
     num_experts_per_tok=config.num_experts_per_tok,
+    static_experts=config.static_experts,  # Added static_experts parameter
     moe_loss=config.moe_loss,
     moe_loss_type=config.moe_loss_type,
     moe_loss_coef=config.moe_loss_coef,
@@ -154,12 +165,14 @@ if config.init_from == 'scratch':
 elif config.init_from == 'resume':
     # Resume training from a checkpoint
     print(f"Resuming training from {config.out_dir}")
-    ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(config.out_dir, 'current_ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Ensure that model configurations match
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
+              'use_moe', 'num_experts', 'num_experts_per_tok', 'static_experts',
+              'moe_loss', 'moe_loss_type', 'moe_loss_coef']:
+        model_args[k] = checkpoint_model_args.get(k, model_args.get(k))
     # Create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -262,6 +275,67 @@ if config.wandb_log and master_process:
     wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=OmegaConf.to_container(config))
 
 # -----------------------------------------------------------------------------
+# Saving the checkpoints
+# -----------------------------------------------------------------------------
+# Function to load existing checkpoints from the output directory
+def load_existing_checkpoints():
+    """
+    Load existing checkpoints from the output directory and populate best_checkpoints.
+    """
+    checkpoint_pattern = re.compile(r'ckpt_iter_(\d+)_val_(\d+\.\d+)\.pt')
+    checkpoint_files = [f for f in os.listdir(config.out_dir) if checkpoint_pattern.match(f)]
+    for ckpt_file in checkpoint_files:
+        match = checkpoint_pattern.match(ckpt_file)
+        if match:
+            iter_num = int(match.group(1))
+            val_loss = float(match.group(2))
+            ckpt_path = os.path.join(config.out_dir, ckpt_file)
+            checkpoint_info = {
+                'val_loss': val_loss,
+                'iter_num': iter_num,
+                'ckpt_path': ckpt_path,
+            }
+            best_checkpoints.append(checkpoint_info)
+    # Sort the checkpoints based on validation loss (lower is better)
+    best_checkpoints.sort(key=lambda x: x['val_loss'])
+    # Keep only the top num_checkpoints
+    while len(best_checkpoints) > config.num_checkpoints:
+        worst_ckpt = best_checkpoints.pop()
+        # Optionally, delete the checkpoint file
+        if os.path.exists(worst_ckpt['ckpt_path']):
+            os.remove(worst_ckpt['ckpt_path'])
+            print(f"Removed old checkpoint {worst_ckpt['ckpt_path']} with val_loss {worst_ckpt['val_loss']:.4f}")
+# Function to update the list of best checkpoints
+def update_best_checkpoints(checkpoint_info):
+    """
+    Update the list of best checkpoints based on validation loss.
+
+    Args:
+        checkpoint_info (dict): A dictionary containing 'val_loss', 'iter_num', and 'ckpt_path'.
+    """
+    print(len(best_checkpoints), config.num_checkpoints)
+    # Add the new checkpoint info
+    best_checkpoints.append(checkpoint_info)
+    print(len(best_checkpoints), config.num_checkpoints)
+    # Sort the checkpoints based on validation loss (lower is better)
+    best_checkpoints.sort(key=lambda x: x['val_loss'])
+    # Keep only the top num_checkpoints
+    if len(best_checkpoints) > config.num_checkpoints:
+        # Remove the checkpoint with the highest validation loss
+        worst_ckpt = best_checkpoints.pop()
+        # Delete the checkpoint file
+        if os.path.exists(worst_ckpt['ckpt_path']):
+            os.remove(worst_ckpt['ckpt_path'])
+            print(f"Removed old checkpoint {worst_ckpt['ckpt_path']} with val_loss {worst_ckpt['val_loss']:.4f}")
+            
+# Initialize a list to keep track of best checkpoints
+best_checkpoints = []
+# Load existing checkpoints if resuming
+if config.init_from == 'resume':
+    load_existing_checkpoints()
+
+
+# -----------------------------------------------------------------------------
 # Training loop
 # -----------------------------------------------------------------------------
 
@@ -277,20 +351,21 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Evaluate the loss and save checkpoints
+    # In the training loop, during evaluation and checkpoint saving
     if iter_num % config.eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"Step {iter_num}: Train loss {losses['train']:.4f}, Val loss {losses['val']:.4f}")
+        val_loss = losses['val']
+        print(f"Step {iter_num}: Train loss {losses['train']:.4f}, Val loss {val_loss:.4f}")
         if config.wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "val/loss": val_loss,
                 "lr": lr,
                 "mfu": running_mfu * 100,  # Convert to percentage
             })
-        if losses['val'] < best_val_loss or config.always_save_checkpoint:
-            best_val_loss = losses['val']
+        if val_loss < best_val_loss or config.always_save_checkpoint:
+            best_val_loss = val_loss
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -300,8 +375,33 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': OmegaConf.to_container(config),
                 }
-                print(f"Saving checkpoint to {config.out_dir}")
-                torch.save(checkpoint, os.path.join(config.out_dir, 'ckpt.pt'))
+                # Save the checkpoint with val_loss in the filename
+                ckpt_path = os.path.join(config.out_dir, f'ckpt_iter_{iter_num}_val_{val_loss:.4f}.pt')
+                print(f"Saving checkpoint to {ckpt_path}")
+                torch.save(checkpoint, ckpt_path)
+
+                # Update the list of best checkpoints
+                checkpoint_info = {
+                    'val_loss': val_loss.item(),
+                    'iter_num': iter_num,
+                    'ckpt_path': ckpt_path,
+                }
+                update_best_checkpoints(checkpoint_info)
+
+        # Save the current model to current_ckpt.pt if save_current_ckpt is True
+        if config.save_current_ckpt:
+            current_ckpt = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+                'config': OmegaConf.to_container(config),
+            }
+            current_ckpt_path = os.path.join(config.out_dir, 'current_ckpt.pt')
+            print(f"Saving current checkpoint to {current_ckpt_path}")
+            torch.save(current_ckpt, current_ckpt_path)
+
     if iter_num == 0 and config.eval_only:
         break
 
@@ -341,7 +441,7 @@ while True:
             for block in raw_model.transformer.h:
                 if isinstance(block.mlp, MoE):
                     usage_percentages = block.mlp.get_usage_percentages()
-                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(block.mlp.num_experts)])
+                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(block.mlp.num_dynamic_experts)])
                     moe_usages.append(f"Block MoE usage: {usage_str}")
                     # Reset usage counts after logging
                     block.mlp.reset_usage_counts()
