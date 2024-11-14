@@ -23,7 +23,6 @@ S3_OUTPUT_DIR="s3://your-s3-bucket/path/to/output/"
 LOCAL_CODE_DIR="/home/eai_role/code/"
 LOCAL_DATA_DIR="/home/eai_role/code/data/"
 LOCAL_OUTPUT_DIR="/home/eai_role/code/out/"
-CHECKPOINT_DIR="/persistent_storage/checkpoints/"  # Directory for checkpoints
 
 # Name and Python version for the conda environment
 ENV_NAME="gpt-env"
@@ -61,42 +60,39 @@ echo "Conda environment '$ENV_NAME' created and activated."
 echo "Installed packages:"
 pip list
 
-# Download checkpoints from S3 if local checkpoint directory is empty
-if [ -z "$(ls -A "$CHECKPOINT_DIR")" ]; then
-  echo "No local checkpoints found. Syncing checkpoints from S3..."
-  aws s3 sync "$S3_OUTPUT_DIR/checkpoints/" "$CHECKPOINT_DIR"
-fi
+# Create the output directory if it doesn't exist
+mkdir -p "$LOCAL_OUTPUT_DIR"
 
-# Function to sync checkpoints periodically to S3
-sync_checkpoints() {
+# Download checkpoints from S3 to out directory if available
+echo "Syncing checkpoints from S3 to local out directory..."
+aws s3 sync "$S3_OUTPUT_DIR" "$LOCAL_OUTPUT_DIR"
+
+# Function to sync outputs and checkpoints periodically to S3
+sync_outputs() {
   while true; do
     sleep 600  # Sync every 10 minutes
-    echo "Periodic checkpoint sync to S3..."
-    aws s3 sync "$CHECKPOINT_DIR" "$S3_OUTPUT_DIR/checkpoints/"
+    echo "Periodic output sync to S3..."
+    aws s3 sync "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_DIR"
   done
 }
 
-# Start the background process to sync checkpoints
-sync_checkpoints &
+# Start the background process to sync outputs
+sync_outputs &
 
 # Run the training script using torchrun for distributed training
 echo "Running training script with torchrun..."
-torchrun --standalone --nproc_per_node=4 "$LOCAL_CODE_DIR/train.py" --checkpoint_dir "$CHECKPOINT_DIR"
+torchrun --standalone --nproc_per_node=4 "$LOCAL_CODE_DIR/train.py" --output_dir "$LOCAL_OUTPUT_DIR"
 
-# Kill the background checkpoint sync process after training completes
-pkill -f sync_checkpoints
+# Kill the background output sync process after training completes
+pkill -f sync_outputs
 
 # Signal that the application is healthy (used by Kubernetes liveness probe)
 touch /tmp/healthy
 
 # Final sync to ensure all outputs and checkpoints are copied after training completes
 echo "Syncing output data to S3..."
-aws s3 sync "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_DIR/out/"
-echo "Data is saved to S3 at $S3_OUTPUT_DIR/out/"
-
-echo "Syncing checkpoints to S3..."
-aws s3 sync "$CHECKPOINT_DIR" "$S3_OUTPUT_DIR/checkpoints/"
-echo "Checkpoints are saved to S3 at $S3_OUTPUT_DIR/checkpoints/"
+aws s3 sync "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_DIR"
+echo "Data is saved to S3 at $S3_OUTPUT_DIR"
 
 # Save the log file to S3
 aws s3 cp "$LOCAL_CODE_DIR/log.txt" "$S3_OUTPUT_DIR/log.txt"

@@ -21,9 +21,6 @@ spec:
       restartPolicy: OnFailure  # Restart policy for the pod
       terminationGracePeriodSeconds: 30  # Time to wait before forceful termination
       volumes:
-        - name: persistent-storage  # Volume for persistent data storage
-          persistentVolumeClaim:
-            claimName: pvc-customgpt
         - name: user-home  # Volume for user home directory
           emptyDir: {}
         - name: shm  # Shared memory volume
@@ -55,9 +52,6 @@ spec:
             - name: REPO_NAME
               value: "hello-api"
           volumeMounts:
-            # Mount persistent storage volume
-            - name: persistent-storage
-              mountPath: /persistent_storage
             # Mount user home directory
             - name: user-home
               mountPath: /home/eai_role

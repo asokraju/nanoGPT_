@@ -9,19 +9,20 @@ This report provides a step-by-step guide to deploying a GPU-accelerated machine
 - **Detailed walkthrough of the Kubernetes YAML configuration**
 - **Instructions on how to deploy the job to a Kubernetes cluster**
 
-By the end of this report, you and your team should have a clear understanding of how to set up and run a GPU-intensive training task on Kubernetes using the provided configurations.
+By the end of this report, we should have a clear understanding of how to set up and run a GPU-intensive training task on Kubernetes using the provided configurations.
 
 ---
 
 ## Table of Contents
 
 1. [Overview of Kubernetes Concepts](#1-overview-of-kubernetes-concepts)
-2. [The Training Script (`script.sh`)](#2-the-training-script-scriptsh)
-   - 2.1 [Explanation of `script.sh`](#21-explanation-of-scriptsh)
-3. [Kubernetes Job Configuration (`job.yaml`)](#3-kubernetes-job-configuration-jobyaml)
-   - 3.1 [Explanation of `job.yaml`](#31-explanation-of-jobyaml)
-4. [Persistent Storage with PersistentVolumeClaim (`pvc.yaml`)](#4-persistent-storage-with-persistentvolumeclaim-pvcyaml)
-   - 4.1 [Explanation of `pvc.yaml`](#41-explanation-of-pvcyaml)
+2. [File Layout and Directory Structure](#2-file-layout-and-directory-structure)
+   - 2.1 [Files in Amazon S3](#21-files-in-amazon-s3)
+   - 2.2 [Directory Structure in the Kubernetes Pod](#22-directory-structure-in-the-kubernetes-pod)
+3. [The Training Script (`script.sh`)](#3-the-training-script-scriptsh)
+   - 3.1 [Explanation of `script.sh`](#31-explanation-of-scriptsh)
+4. [Kubernetes Job Configuration (`job.yaml`)](#4-kubernetes-job-configuration-jobyaml)
+   - 4.1 [Explanation of `job.yaml`](#41-explanation-of-jobyaml)
 5. [Deployment Steps](#5-deployment-steps)
 6. [Conclusion](#6-conclusion)
 
@@ -37,8 +38,6 @@ Before diving into the configurations, let's briefly cover some Kubernetes conce
 - **Job**: A controller that creates one or more pods to run a finite task to completion.
 - **Container**: An instance of a Docker image running within a pod.
 - **ConfigMap**: A Kubernetes object to store non-confidential configuration data in key-value pairs.
-- **PersistentVolume (PV)**: A piece of storage in the cluster that has been provisioned by an administrator or dynamically provisioned using Storage Classes.
-- **PersistentVolumeClaim (PVC)**: A request for storage by a user that can be fulfilled by a PV.
 - **Volume**: A directory, possibly with data in it, accessible to the containers in a pod.
 - **Resource Requests and Limits**: Specifications to inform Kubernetes about the minimum and maximum resources (CPU, memory, GPU) a container needs.
 - **Probes (Liveness and Readiness)**: Mechanisms to check the health and readiness of a container.
@@ -84,7 +83,7 @@ s3://your-s3-bucket/path/to/data/
 - **train.bin**: Serialized training data.
 - **val.bin**: Serialized validation data.
 
-### 7.2 Directory Structure in the Kubernetes Pod
+### 2.2 Directory Structure in the Kubernetes Pod
 
 After copying the files from Amazon S3 to the pod, the directory structure within the container is organized as follows:
 
@@ -98,16 +97,16 @@ After copying the files from Amazon S3 to the pod, the directory structure withi
 ├── config/
 │   └── conf.yaml
 ├── data/
-│   └── train.bin
-│   └── val.bin.yaml
-└── out  # Generated during execution
-│   └── log.txt
-│   └── current_ckpt.pt
-│   └── checkpoint_1.pt
-│   └── checkpoint_2.pt
+│   ├── train.bin
+│   └── val.bin
+├── out/  # Generated during execution
+│   ├── log.txt
+│   ├── current_ckpt.pt
+│   ├── checkpoint_1.pt
+│   ├── checkpoint_2.pt
 │   └── events.out.tfevents.xxxxx
 ├── script.sh
-└── job.yaml (# not required here! Copied here for completeness)
+└── job.yaml  # Not required here, copied for completeness
 ```
 
 - **/home/eai_role/code/**: The directory where code files are stored.
@@ -122,7 +121,7 @@ After copying the files from Amazon S3 to the pod, the directory structure withi
 
 ---
 
-By understanding the file layout and directory structure, we can better navigate the environment within the Kubernetes pod, making it easier to debug issues, adjust configurations, and manage outputs. This structured approach also facilitates collaboration and scalability, we can easily locate and work with the necessary files and directories.
+By understanding the file layout and directory structure, we can better navigate the environment within the Kubernetes pod, making it easier to debug issues, adjust configurations, and manage outputs. This structured approach also facilitates collaboration and scalability, as we can easily locate and work with the necessary files and directories.
 
 ## 3. The Training Script (`script.sh`)
 
@@ -135,9 +134,9 @@ The `script.sh` script is designed to work with the specified directory structur
 - **Variables**: The script defines variables for all the important directories and S3 paths.
 - **Sync Operations**: Uses `aws s3 sync` commands to synchronize code and data from S3 to the appropriate local directories.
 - **Training Execution**: Points the training script to the correct data and output directories.
-- **Checkpointing**: Saves checkpoints to both the output directory and the persistent storage directory.
-- **Periodic Syncing**: The background process ensures that checkpoints in the persistent storage are periodically synced to S3.
-- **Final Syncing**: After training, the script syncs the output directory back to S3, including logs and checkpoints.
+- **Checkpoint Handling**: Downloads checkpoints from S3 to resume training if available.
+- **Periodic Syncing**: The background process ensures that outputs and checkpoints in the `out` directory are periodically synced to S3.
+- **Final Syncing**: After training, the script syncs the `out` directory back to S3, including logs and checkpoints.
 
 Below is the complete `script.sh` file with comments explaining each section.
 
@@ -167,7 +166,6 @@ S3_OUTPUT_DIR="s3://your-s3-bucket/path/to/output/"
 LOCAL_CODE_DIR="/home/eai_role/code/"
 LOCAL_DATA_DIR="/home/eai_role/code/data/"
 LOCAL_OUTPUT_DIR="/home/eai_role/code/out/"
-CHECKPOINT_DIR="/persistent_storage/checkpoints/"  # Directory for checkpoints
 
 # Name and Python version for the conda environment
 ENV_NAME="gpt-env"
@@ -205,30 +203,31 @@ echo "Conda environment '$ENV_NAME' created and activated."
 echo "Installed packages:"
 pip list
 
-# Download checkpoints from S3 if local checkpoint directory is empty
-if [ -z "$(ls -A "$CHECKPOINT_DIR")" ]; then
-  echo "No local checkpoints found. Syncing checkpoints from S3..."
-  aws s3 sync "$S3_OUTPUT_DIR/checkpoints/" "$CHECKPOINT_DIR"
-fi
+# Create the output directory if it doesn't exist
+mkdir -p "$LOCAL_OUTPUT_DIR"
 
-# Function to sync checkpoints periodically to S3
-sync_checkpoints() {
+# Download checkpoints from S3 to out directory if available
+echo "Syncing checkpoints from S3 to local out directory..."
+aws s3 sync "$S3_OUTPUT_DIR/out/" "$LOCAL_OUTPUT_DIR"
+
+# Function to sync outputs and checkpoints periodically to S3
+sync_outputs() {
   while true; do
     sleep 600  # Sync every 10 minutes
-    echo "Periodic checkpoint sync to S3..."
-    aws s3 sync "$CHECKPOINT_DIR" "$S3_OUTPUT_DIR/checkpoints/"
+    echo "Periodic output sync to S3..."
+    aws s3 sync "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_DIR/out/"
   done
 }
 
-# Start the background process to sync checkpoints
-sync_checkpoints &
+# Start the background process to sync outputs
+sync_outputs &
 
 # Run the training script using torchrun for distributed training
 echo "Running training script with torchrun..."
-torchrun --standalone --nproc_per_node=4 "$LOCAL_CODE_DIR/train.py" --checkpoint_dir "$CHECKPOINT_DIR"
+torchrun --standalone --nproc_per_node=4 "$LOCAL_CODE_DIR/train.py" --output_dir "$LOCAL_OUTPUT_DIR"
 
-# Kill the background checkpoint sync process after training completes
-pkill -f sync_checkpoints
+# Kill the background output sync process after training completes
+pkill -f sync_outputs
 
 # Signal that the application is healthy (used by Kubernetes liveness probe)
 touch /tmp/healthy
@@ -237,10 +236,6 @@ touch /tmp/healthy
 echo "Syncing output data to S3..."
 aws s3 sync "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_DIR/out/"
 echo "Data is saved to S3 at $S3_OUTPUT_DIR/out/"
-
-echo "Syncing checkpoints to S3..."
-aws s3 sync "$CHECKPOINT_DIR" "$S3_OUTPUT_DIR/checkpoints/"
-echo "Checkpoints are saved to S3 at $S3_OUTPUT_DIR/checkpoints/"
 
 # Save the log file to S3
 aws s3 cp "$LOCAL_CODE_DIR/log.txt" "$S3_OUTPUT_DIR/log.txt"
@@ -252,18 +247,19 @@ echo "Log file is saved to S3 at $S3_OUTPUT_DIR/log.txt"
 - **Output Redirection**: All output is logged to `log.txt` for debugging and auditing.
 - **Environment Setup**: Uses conda to create and activate an isolated Python environment.
 - **Data Synchronization**: Downloads code and data from Amazon S3 to local directories.
-- **Checkpoint Handling**: Periodically syncs checkpoints to S3 to prevent data loss.
+- **Checkpoint Handling**: Syncs checkpoints from S3 to the `out` directory to resume training if available.
+- **Periodic Syncing**: Periodically syncs the `out` directory to S3 to prevent data loss.
 - **Training Execution**: Runs the training script using `torchrun` for distributed GPU training.
 - **Health Signals**: Creates files (`/tmp/ready` and `/tmp/healthy`) to signal readiness and liveness to Kubernetes.
 - **Cleanup**: Syncs final outputs and logs back to S3 after training completes.
 
 ---
 
-## 3. Kubernetes Job Configuration (`job.yaml`)
+## 4. Kubernetes Job Configuration (`job.yaml`)
 
 The `job.yaml` file defines the Kubernetes Job that orchestrates the training task.
 
-### 3.1 Explanation of `job.yaml`
+### 4.1 Explanation of `job.yaml`
 
 The `job.yaml` file defines a Kubernetes Job resource, which specifies how to run a batch job on the cluster. Below, we break down the key components of the file and explain their purposes, focusing on `template` and `spec`, as well as including key points for clarity.
 
@@ -293,9 +289,6 @@ spec:
       restartPolicy: OnFailure  # Restart policy for the pod
       terminationGracePeriodSeconds: 30  # Time to wait before forceful termination
       volumes:
-        - name: persistent-storage  # Volume for persistent data storage
-          persistentVolumeClaim:
-            claimName: pvc-customgpt
         - name: user-home  # Volume for user home directory
           emptyDir: {}
         - name: shm  # Shared memory volume
@@ -327,9 +320,6 @@ spec:
             - name: REPO_NAME
               value: "hello-api"
           volumeMounts:
-            # Mount persistent storage volume
-            - name: persistent-storage
-              mountPath: /persistent_storage
             # Mount user home directory
             - name: user-home
               mountPath: /home/eai_role
@@ -363,7 +353,6 @@ spec:
             initialDelaySeconds: 60    # Wait before starting readiness checks
             periodSeconds: 15          # Time between readiness checks
 ```
-
 
 #### **Key Components**
 
@@ -477,13 +466,10 @@ spec:
 
 ##### **6. volumes and volumeMounts**
 
-Volumes are defined at the pod level and are used to share data between containers or persist data.
+Volumes are defined at the pod level and are used to share data between containers or provide necessary filesystem resources.
 
 ```yaml
 volumes:
-  - name: persistent-storage
-    persistentVolumeClaim:
-      claimName: pvc-customgpt
   - name: user-home
     emptyDir: {}
   - name: shm
@@ -495,7 +481,6 @@ volumes:
       name: script-configmap
 ```
 
-- **persistent-storage**: A volume linked to a PersistentVolumeClaim, used for data that needs to persist across pod restarts.
 - **user-home**: An empty directory that is created for the pod; data is lost when the pod is deleted.
 - **shm**: An in-memory volume used for shared memory; beneficial for certain applications like PyTorch.
 - **script-volume**: A volume that injects the `script.sh` file from a ConfigMap into the container.
@@ -504,8 +489,6 @@ volumes:
 
 ```yaml
 volumeMounts:
-  - name: persistent-storage
-    mountPath: /persistent_storage
   - name: user-home
     mountPath: /home/eai_role
   - name: shm
@@ -520,7 +503,7 @@ volumeMounts:
 - **subPath**: Allows mounting a single file from the volume (useful for ConfigMaps).
 - **readOnly**: Ensures the volume is mounted as read-only.
 
-**Key Point**: Volumes and volume mounts are essential for data persistence, sharing data between containers, and injecting configuration files into containers.
+**Key Point**: Volumes and volume mounts are essential for data sharing between containers and injecting configuration files into containers.
 
 ##### **7. containers**
 
@@ -629,7 +612,6 @@ readinessProbe:
   - **template**: Defines the pod template used by the Job to create pods.
   - **spec**: Within the template, specifies the configuration and behavior of the pods.
 - **Resource Allocation**: Properly specifying resource requests and limits ensures efficient scheduling and resource utilization.
-- **Data Persistence**: Using PersistentVolumeClaims and volumes allows data to persist across pod restarts.
 - **Configuration Management**: ConfigMaps and environment variables provide flexible configuration without modifying container images.
 - **Command Execution**: Custom commands allow for dynamic execution and flexibility in running scripts.
 - **Health Monitoring**: Liveness and readiness probes enable Kubernetes to manage container health and readiness effectively.
@@ -637,36 +619,6 @@ readinessProbe:
 ---
 
 By understanding the purpose and functionality of each component in the `job.yaml` file, your team can confidently modify and deploy Kubernetes Jobs for various applications, ensuring efficient resource utilization and application reliability.
-
-## 4. Persistent Storage with PersistentVolumeClaim (`pvc.yaml`)
-
-To ensure data persistence across pod restarts, we use a PersistentVolumeClaim (PVC).
-
-### 4.1 Explanation of `pvc.yaml`
-
-Below is the `pvc.yaml` file with comments.
-
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pvc-customgpt  # Name of the PVC
-  namespace: dsedge-nogbd  # Namespace where the PVC is created
-spec:
-  accessModes:
-    - ReadWriteOnce  # The volume can be mounted as read-write by a single node
-  resources:
-    requests:
-      storage: 100Gi  # Request 100Gi of storage
-```
-
-#### Key Points:
-
-- **PersistentVolumeClaim**: Requests storage resources from the cluster.
-- **accessModes**: Specifies how the volume can be mounted.
-- **resources.requests.storage**: Specifies the amount of storage requested.
-
----
 
 ## 5. Deployment Steps
 
@@ -691,15 +643,7 @@ Create a ConfigMap from your `script.sh` file.
 kubectl create configmap script-configmap --from-file=script.sh -n dsedge-nogbd
 ```
 
-### Step 4: Create the PersistentVolumeClaim
-
-Apply the `pvc.yaml` to create the PVC.
-
-```bash
-kubectl apply -f pvc.yaml
-```
-
-### Step 5: Deploy the Kubernetes Job
+### Step 4: Deploy the Kubernetes Job
 
 Apply the `job.yaml` to deploy the job.
 
@@ -707,7 +651,7 @@ Apply the `job.yaml` to deploy the job.
 kubectl apply -f job.yaml
 ```
 
-### Step 6: Monitor the Job
+### Step 5: Monitor the Job
 
 Check the status of the job and pods.
 
@@ -722,11 +666,11 @@ View logs to monitor progress.
 kubectl logs <pod-name> -n dsedge-nogbd
 ```
 
-### Step 7: Verify S3 Synchronization
+### Step 6: Verify S3 Synchronization
 
 Ensure that outputs and checkpoints are being synced to your S3 bucket as expected.
 
-### Step 8: Handle Pod Restarts (If Any)
+### Step 7: Handle Pod Restarts (If Any)
 
 If the pod restarts due to failure:
 
@@ -740,7 +684,7 @@ If the pod restarts due to failure:
 By following this guide, you can deploy a GPU-accelerated training job on Kubernetes that:
 
 - Utilizes multiple GPUs for intensive computations.
-- Ensures data persistence through the use of PersistentVolumes and periodic checkpointing.
+- Ensures data persistence by syncing outputs and checkpoints directly with S3.
 - Incorporates health checks for robust monitoring and automatic recovery.
 - Leverages Kubernetes features like Jobs, ConfigMaps, and Probes for efficient orchestration.
 
@@ -752,6 +696,5 @@ This setup is scalable and can be adapted to different training tasks or environ
 
 - **Kubernetes Documentation**: [https://kubernetes.io/docs/home/](https://kubernetes.io/docs/home/)
 - **Kubernetes Jobs**: [https://kubernetes.io/docs/concepts/workloads/controllers/job/](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
-- **Persistent Volumes**: [https://kubernetes.io/docs/concepts/storage/persistent-volumes/](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
 - **ConfigMaps**: [https://kubernetes.io/docs/concepts/configuration/configmap/](https://kubernetes.io/docs/concepts/configuration/configmap/)
 - **GPU Support in Kubernetes**: [https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
