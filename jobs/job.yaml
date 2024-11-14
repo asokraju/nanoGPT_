@@ -1,0 +1,92 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: customgpt-job  # Name of the Job
+  namespace: dsedge-nogbd  # Namespace where the Job will run
+  labels:
+    job-name: customgpt-job  # Label for identifying the job
+    batch-size: "1200"  # Custom label
+    moe-coef: "0.1"     # Custom label
+  annotations:
+    batch-size: "1200"  # Annotation for metadata
+    moe-coef: "0.1"     # Annotation for metadata
+spec:
+  backoffLimit: 2  # Number of retries before considering the job failed
+  template:
+    metadata:
+      labels:
+        job-name: customgpt-job  # Label for the pod template
+    spec:
+      serviceAccountName: default-editor  # Service account with necessary permissions
+      restartPolicy: OnFailure  # Restart policy for the pod
+      terminationGracePeriodSeconds: 30  # Time to wait before forceful termination
+      volumes:
+        - name: persistent-storage  # Volume for persistent data storage
+          persistentVolumeClaim:
+            claimName: pvc-customgpt
+        - name: user-home  # Volume for user home directory
+          emptyDir: {}
+        - name: shm  # Shared memory volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "4Gi"
+        - name: script-volume  # Volume for script.sh from ConfigMap
+          configMap:
+            name: script-configmap
+      containers:
+        - name: customgpt  # Name of the container
+          image: your-docker-image  # Replace with your Docker image
+          imagePullPolicy: IfNotPresent  # Pull image only if not present
+          resources:
+            requests:
+              cpu: "4"                # Minimum CPU requested
+              memory: "32Gi"          # Minimum memory requested
+              nvidia.com/gpu: "4"     # Request 4 GPUs
+            limits:
+              cpu: "8"                # Maximum CPU allowed
+              memory: "64Gi"          # Maximum memory allowed
+              nvidia.com/gpu: "4"     # Limit to 4 GPUs
+          env:
+            # Environment variables for the container
+            - name: TARGET
+              value: "Python Sample v3"
+            - name: S3_BUCKET_SRC
+              value: "s3://your-s3-bucket/path/to/code/"
+            - name: REPO_NAME
+              value: "hello-api"
+          volumeMounts:
+            # Mount persistent storage volume
+            - name: persistent-storage
+              mountPath: /persistent_storage
+            # Mount user home directory
+            - name: user-home
+              mountPath: /home/eai_role
+            # Mount shared memory
+            - name: shm
+              mountPath: /dev/shm
+            # Mount script.sh into the container
+            - name: script-volume
+              mountPath: /home/eai_role/code/script.sh
+              subPath: script.sh
+              readOnly: true
+          command:
+            - "/bin/bash"
+            - "-c"
+            - |
+              # Make script.sh executable and run it
+              chmod +x /home/eai_role/code/script.sh
+              /home/eai_role/code/script.sh
+          livenessProbe:
+            exec:
+              command:
+                - cat
+                - /tmp/healthy  # Checks for the existence of /tmp/healthy
+            initialDelaySeconds: 120   # Wait before starting liveness checks
+            periodSeconds: 30          # Time between liveness checks
+          readinessProbe:
+            exec:
+              command:
+                - cat
+                - /tmp/ready    # Checks for the existence of /tmp/ready
+            initialDelaySeconds: 60    # Wait before starting readiness checks
+            periodSeconds: 15          # Time between readiness checks

@@ -59,7 +59,7 @@ fi
 
 # Start background sync process
 echo "Starting background sync process to S3..."
-(
+( 
     while true; do
         sleep 3600  # Sleep for 1 hour
         echo "Syncing 'out' directory to S3..."
