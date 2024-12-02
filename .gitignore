@@ -16,3 +16,4 @@ results
 training.log
 .gitignore
 flash-attention
+out

@@ -1,25 +1,20 @@
 """
-Training script for GPT model with Mixture of Experts (MoE) integration.
+Training script for GPT-MoE model with LoRA integration.
 This script supports both single GPU and distributed data parallel (DDP) training.
 
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+To run on a single GPU:
+$ python train.py
 
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+To run with DDP on 4 GPUs on 1 node:
+$ torchrun --standalone --nproc_per_node=1 train_torch.py
 
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=1 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-
+Dependencies:
+- torch
+- omegaconf
+- numpy
+- peft (for LoRA)
 """
-import re
+
 import os
 import time
 import math
@@ -31,7 +26,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_torch import GPTConfig, GPT, MoE
+from model_torch import GPTConfig, GPT  # Import your GPT-MoE model here
 
 # Import OmegaConf for configuration management
 from omegaconf import OmegaConf
@@ -86,6 +81,12 @@ if not hasattr(config, 'num_checkpoints'):
     config.num_checkpoints = 5  # Default value
 if not hasattr(config, 'save_current_ckpt'):
     config.save_current_ckpt = True  # Default value
+if not hasattr(config, 'save_lora_only'):
+    config.save_lora_only = True  # Default: save only LoRA parameters
+if not hasattr(config, 'lora_ckpt_path'):
+    config.lora_ckpt_path = os.path.join(config.out_dir, 'lora_ckpt')  # Default path for LoRA parameters
+if not hasattr(config, 'merged_model_ckpt_path'):
+    config.merged_model_ckpt_path = os.path.join(config.out_dir, 'merged_model.pt')  # Default path for merged model
 
 # -----------------------------------------------------------------------------
 # Data loading
@@ -147,7 +148,7 @@ model_args = dict(
     use_moe=config.use_moe,
     num_experts=config.num_experts,
     num_experts_per_tok=config.num_experts_per_tok,
-    static_experts=config.static_experts,  # Added static_experts parameter
+    static_experts=config.static_experts,
     moe_loss=config.moe_loss,
     moe_loss_type=config.moe_loss_type,
     moe_loss_coef=config.moe_loss_coef,
@@ -169,9 +170,7 @@ elif config.init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Ensure that model configurations match
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-              'use_moe', 'num_experts', 'num_experts_per_tok', 'static_experts',
-              'moe_loss', 'moe_loss_type', 'moe_loss_coef']:
+    for k in model_args:
         model_args[k] = checkpoint_model_args.get(k, model_args.get(k))
     # Create the model
     gptconf = GPTConfig(**model_args)
@@ -179,15 +178,61 @@ elif config.init_from == 'resume':
     state_dict = checkpoint['model']
     # Fix state_dict keys if needed
     unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
+    for k in list(state_dict.keys()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif config.init_from == 'finetune':
+    # Fine-tune your own pre-trained GPT-MoE model with LoRA
+    print("Loading your pre-trained GPT-MoE model for fine-tuning with LoRA")
+    # Load your saved model checkpoint
+    ckpt_path = config.finetune_ckpt_path  # Path to your saved checkpoint
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint file not found at {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # Update model_args with values from the checkpoint
+    for k in model_args:
+        model_args[k] = checkpoint_model_args.get(k, model_args.get(k))
+    # Create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # Fix state_dict keys if needed
+    unwanted_prefix = '_orig_mod.'
+    for k in list(state_dict.keys()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    print("Successfully loaded your pre-trained GPT-MoE model.")
+
+    # Apply LoRA to the model
+    print("Applying LoRA to the model")
+    # Ensure that the peft library is installed
+    try:
+        from peft import get_peft_model, LoraConfig, TaskType
+    except ImportError:
+        raise ImportError("To use LoRA, please install the 'peft' library.")
+
+    # Define LoRA configuration
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=list(config.lora_target_modules),
+        lora_dropout=config.lora_dropout
+        # bias='none',
+        # task_type=TaskType.CAUSAL_LM
+    )
+    # Apply LoRA to the model
+    model = get_peft_model(model, lora_config)
+    print("LoRA has been applied to the model.")
+    # Start iter_num from 0 for fine-tuning
+    iter_num = 0
+    best_val_loss = 1e9
 else:
-    # Handle other initialization methods (e.g., from pretrained GPT-2)
-    pass  # Implement as needed
+    raise ValueError(f"Unknown init_from option: {config.init_from}")
 
 # Adjust block size if necessary
 if config.block_size < model.config.block_size:
@@ -200,11 +245,20 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(config.dtype == 'float16'))
 
 # Optimizer
-optimizer = model.configure_optimizers(
-    config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device_type)
-if config.init_from == 'resume':
+if config.init_from == 'finetune':
+    # Only optimize LoRA parameters
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, betas=(config.beta1, config.beta2), weight_decay=config.weight_decay
+    )
+    print("Optimizer is set to only update LoRA parameters.")
+elif config.init_from == 'resume':
+    optimizer = model.configure_optimizers(
+        config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device_type)
     optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None  # Free up memory
+    checkpoint = None  # Free up memory
+else:
+    optimizer = model.configure_optimizers(
+        config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device_type)
 
 # Compile the model (requires PyTorch 2.0)
 if config.compile:
@@ -277,6 +331,7 @@ if config.wandb_log and master_process:
 # -----------------------------------------------------------------------------
 # Saving the checkpoints
 # -----------------------------------------------------------------------------
+
 # Function to load existing checkpoints from the output directory
 def load_existing_checkpoints():
     """
@@ -305,6 +360,7 @@ def load_existing_checkpoints():
         if os.path.exists(worst_ckpt['ckpt_path']):
             os.remove(worst_ckpt['ckpt_path'])
             print(f"Removed old checkpoint {worst_ckpt['ckpt_path']} with val_loss {worst_ckpt['val_loss']:.4f}")
+
 # Function to update the list of best checkpoints
 def update_best_checkpoints(checkpoint_info):
     """
@@ -313,10 +369,8 @@ def update_best_checkpoints(checkpoint_info):
     Args:
         checkpoint_info (dict): A dictionary containing 'val_loss', 'iter_num', and 'ckpt_path'.
     """
-    print(len(best_checkpoints), config.num_checkpoints)
     # Add the new checkpoint info
     best_checkpoints.append(checkpoint_info)
-    print(len(best_checkpoints), config.num_checkpoints)
     # Sort the checkpoints based on validation loss (lower is better)
     best_checkpoints.sort(key=lambda x: x['val_loss'])
     # Keep only the top num_checkpoints
@@ -327,13 +381,12 @@ def update_best_checkpoints(checkpoint_info):
         if os.path.exists(worst_ckpt['ckpt_path']):
             os.remove(worst_ckpt['ckpt_path'])
             print(f"Removed old checkpoint {worst_ckpt['ckpt_path']} with val_loss {worst_ckpt['val_loss']:.4f}")
-            
+
 # Initialize a list to keep track of best checkpoints
 best_checkpoints = []
 # Load existing checkpoints if resuming
 if config.init_from == 'resume':
     load_existing_checkpoints()
-
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -367,7 +420,41 @@ while True:
         if val_loss < best_val_loss or config.always_save_checkpoint:
             best_val_loss = val_loss
             if iter_num > 0:
-                checkpoint = {
+                # Checkpoint saving logic
+                if config.save_lora_only and config.init_from == 'finetune':
+                    # Save only LoRA parameters
+                    model.save_pretrained(config.lora_ckpt_path)
+                    print(f"Saved LoRA parameters to {config.lora_ckpt_path}")
+                else:
+                    # Save the full model checkpoint
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': OmegaConf.to_container(config),
+                    }
+                    # Save the checkpoint with val_loss in the filename
+                    ckpt_path = os.path.join(config.out_dir, f'ckpt_iter_{iter_num}_val_{val_loss:.4f}.pt')
+                    print(f"Saving checkpoint to {ckpt_path}")
+                    torch.save(checkpoint, ckpt_path)
+                    # Update the list of best checkpoints
+                    checkpoint_info = {
+                        'val_loss': val_loss.item(),
+                        'iter_num': iter_num,
+                        'ckpt_path': ckpt_path,
+                    }
+                    update_best_checkpoints(checkpoint_info)
+
+        # Save the current model to current_ckpt.pt if save_current_ckpt is True
+        if config.save_current_ckpt:
+            if config.save_lora_only and config.init_from == 'finetune':
+                # Save only LoRA parameters
+                model.save_pretrained(config.lora_ckpt_path)
+                print(f"Saved current LoRA parameters to {config.lora_ckpt_path}")
+            else:
+                current_ckpt = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
@@ -375,32 +462,9 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': OmegaConf.to_container(config),
                 }
-                # Save the checkpoint with val_loss in the filename
-                ckpt_path = os.path.join(config.out_dir, f'ckpt_iter_{iter_num}_val_{val_loss:.4f}.pt')
-                print(f"Saving checkpoint to {ckpt_path}")
-                torch.save(checkpoint, ckpt_path)
-
-                # Update the list of best checkpoints
-                checkpoint_info = {
-                    'val_loss': val_loss.item(),
-                    'iter_num': iter_num,
-                    'ckpt_path': ckpt_path,
-                }
-                update_best_checkpoints(checkpoint_info)
-
-        # Save the current model to current_ckpt.pt if save_current_ckpt is True
-        if config.save_current_ckpt:
-            current_ckpt = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': OmegaConf.to_container(config),
-            }
-            current_ckpt_path = os.path.join(config.out_dir, 'current_ckpt.pt')
-            print(f"Saving current checkpoint to {current_ckpt_path}")
-            torch.save(current_ckpt, current_ckpt_path)
+                current_ckpt_path = os.path.join(config.out_dir, 'current_ckpt.pt')
+                print(f"Saving current checkpoint to {current_ckpt_path}")
+                torch.save(current_ckpt, current_ckpt_path)
 
     if iter_num == 0 and config.eval_only:
         break
@@ -439,9 +503,9 @@ while True:
         if config.use_moe:
             moe_usages = []
             for block in raw_model.transformer.h:
-                if isinstance(block.mlp, MoE):
+                if hasattr(block.mlp, 'get_usage_percentages'):
                     usage_percentages = block.mlp.get_usage_percentages()
-                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(block.mlp.num_dynamic_experts)])
+                    usage_str = ", ".join([f"Expert {i}: {usage_percentages[i]:.2f}%" for i in range(len(usage_percentages))])
                     moe_usages.append(f"Block MoE usage: {usage_str}")
                     # Reset usage counts after logging
                     block.mlp.reset_usage_counts()
@@ -469,3 +533,16 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+# -----------------------------------------------------------------------------
+# Saving the final model
+# -----------------------------------------------------------------------------
+
+if master_process and config.init_from == 'finetune':
+    if not config.save_lora_only:
+        # Merge LoRA parameters into the base model and save
+        print("Merging LoRA parameters into the base model")
+        model = model.merge_and_unload()
+        # Save the merged model
+        torch.save(model.state_dict(), config.merged_model_ckpt_path)
+        print(f"Saved merged model to {config.merged_model_ckpt_path}")

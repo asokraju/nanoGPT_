@@ -1,4 +1,4 @@
-# Configuration file for training GPT with MoE
+# Configuration file for training GPT with MoE and LoRA
 
 # I/O
 out_dir: 'out'
@@ -7,7 +7,8 @@ log_interval: 1
 eval_iters: 20
 eval_only: False  # If True, script exits right after the first eval
 always_save_checkpoint: True  # If True, always save a checkpoint after each eval
-init_from: 'resume'  # 'scratch' or 'resume' or 'gpt2*'
+init_from: 'finetune'  # 'scratch', 'resume', or 'finetune'
+finetune_ckpt_path: 'C:\Users\Kosaraju\nanoGPT-1\out\current_ckpt.pt'  # Path to your base model checkpoint
 num_checkpoints: 2
 save_current_ckpt: True
 
@@ -37,6 +38,24 @@ static_experts: 2  # Number of static experts to use
 moe_loss: True
 moe_loss_type: 'entropy_regularization'
 moe_loss_coef: 0.01
+
+# LoRA configuration
+lora_r: 8
+lora_alpha: 32
+lora_dropout: 0.1
+lora_target_modules:
+  - 'attn.c_attn'
+  - 'attn.c_proj'
+  # - 'mlp.c_fc'
+  # - 'mlp.c_proj'
+  # - 'mlp.dynamic_experts.*.c_fc'
+  # - 'mlp.dynamic_experts.*.c_proj'
+  # - 'gate'  # If you want to apply LoRA to the gating network
+
+# Saving options
+save_lora_only: true  # Set to true to save only LoRA parameters
+lora_ckpt_path: 'out/lora_ckpt'  # Path to save LoRA parameters
+merged_model_ckpt_path: 'out/merged_model.pt'  # Path to save merged model
 
 # AdamW optimizer
 learning_rate: 6e-4  # Max learning rate

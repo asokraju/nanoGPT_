@@ -308,7 +308,7 @@ class Block(nn.Module):
         return x, auxiliary_loss
 
 @dataclass
-class GPTConfig:
+class GPTConfig2:
     """
     Configuration class for GPT model.
 
@@ -329,20 +329,70 @@ class GPTConfig:
         moe_loss_coef (float): Coefficient for the auxiliary loss.
     """
     block_size: int = 1024
-    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # MoE parameters
-    use_moe: bool = True  # Whether to use MoE in MLP layers
-    num_experts: int = 4  # Number of dynamic experts in MoE
-    num_experts_per_tok: int = 2  # Number of experts per token
-    static_experts: int = 0  # Number of static experts
-    moe_loss: bool = True  # Whether to use auxiliary loss
-    moe_loss_type: str = 'variance_penalty'  # Type of auxiliary loss
-    moe_loss_coef: float = 0.01  # Coefficient for the auxiliary loss
+    bias: bool = True
+    use_moe: bool = True
+    num_experts: int = 4
+    num_experts_per_tok: int = 2
+    static_experts: int = 0
+    moe_loss: bool = True
+    moe_loss_type: str = 'variance_penalty'
+    moe_loss_coef: float = 0.01
+    tie_word_embeddings: bool = True  # Add this attribute
+
+    def get(self, key, default=None):
+        """
+        Mimic the dictionary get method to access attributes.
+        """
+        return getattr(self, key, default)
+
+from transformers import PretrainedConfig
+
+class GPTConfig(PretrainedConfig):
+    """
+    Configuration class for GPT model with MoE.
+
+    Inherits from transformers.PretrainedConfig to ensure compatibility with libraries expecting this interface.
+    """
+
+    def __init__(
+        self,
+        vocab_size=50304,
+        n_embd=768,
+        n_layer=12,
+        n_head=12,
+        block_size=1024,
+        dropout=0.0,
+        bias=True,
+        use_moe=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        static_experts=0,
+        moe_loss=True,
+        moe_loss_type='variance_penalty',
+        moe_loss_coef=0.01,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.block_size = block_size
+        self.dropout = dropout
+        self.bias = bias
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.static_experts = static_experts
+        self.moe_loss = moe_loss
+        self.moe_loss_type = moe_loss_type
+        self.moe_loss_coef = moe_loss_coef
+        self.tie_word_embeddings = True  # Add this attribute
 
 class GPT(nn.Module):
     """
